@@ -5,11 +5,13 @@ using BenchmarkDotNet.Jobs;
 using BenchmarkDotNet.Order;
 using BenchmarkDotNet.Running;
 using SuperKv;
+using System.Net;
+using System.Net.Sockets;
 
-Job job = Environment.GetEnvironmentVariable("SUPERKV_BENCHMARK_JOB")?.ToLowerInvariant() switch
+Job job = Environment.GetEnvironmentVariable("SUPERKV_BENCHMARK_JOB")?.ToUpperInvariant() switch
 {
-    "medium" => Job.MediumRun,
-    "long" => Job.LongRun,
+    "MEDIUM" => Job.MediumRun,
+    "LONG" => Job.LongRun,
     _ => Job.ShortRun
 };
 var config = ManualConfig.Create(DefaultConfig.Instance)
@@ -23,8 +25,7 @@ BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args, config);
 [Orderer(SummaryOrderPolicy.FastestToSlowest)]
 public class SuperKvBenchmarks
 {
-    CancellationTokenSource? _shutdown;
-    Task? _serverTask;
+    SuperKvServer? _server;
     SuperKvClient? _client;
     byte[] _value = null!;
 
@@ -34,15 +35,17 @@ public class SuperKvBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        string pipeName = $"SuperKv.Benchmark.{Guid.NewGuid():N}";
-        _shutdown = new CancellationTokenSource();
-        var server = new SuperKvMemoryServer(new SuperKvServerOptions { PipeName = pipeName });
-        _serverTask = Task.Factory.StartNew(
-            () => server.Run(_shutdown.Token),
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
-        _client = SuperKvClient.Connect(new SuperKvOptions { PipeName = pipeName });
+        int port = GetAvailablePort();
+        _server = SuperKvServer.Create(new SuperKvServerOptions
+        {
+            Port = port,
+            IndexSize = "16m",
+            MemorySize = "128m"
+        });
+        _client = SuperKvClient.Create(new SuperKvOptions
+        {
+            ConnectionString = _server.ConnectionString
+        });
         _value = new byte[ValueSize];
         Random.Shared.NextBytes(_value);
         _client.Set("read", _value);
@@ -57,13 +60,18 @@ public class SuperKvBenchmarks
     public void Set() => _client!.Set("write", _value);
 
     [GlobalCleanup]
-    public async Task Cleanup()
+    public void Cleanup()
     {
         _client?.Dispose();
-        if (_shutdown is not null)
-            await _shutdown.CancelAsync();
-        if (_serverTask is not null)
-            await _serverTask;
-        _shutdown?.Dispose();
+        _server?.Dispose();
+    }
+
+    static int GetAvailablePort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
     }
 }

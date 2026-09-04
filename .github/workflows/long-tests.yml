@@ -36,18 +36,20 @@ env:
 
 jobs:
   stress:
-    name: Stress - ${{ matrix.sdk }} SDK - ${{ matrix.clients }} clients
+    name: Stress - ${{ matrix.sdk }} - ${{ matrix.clients }} clients - ${{ matrix.connection_mode }}
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       matrix:
         sdk: [8.0.x, 10.0.x]
         clients: [1, 8, 32]
+        connection_mode: [owned, shared]
     env:
       SUPERKV_LONG_TESTS: 1
       SUPERKV_LONG_CLIENTS: ${{ matrix.clients }}
+      SUPERKV_LONG_CONNECTION_MODE: ${{ matrix.connection_mode }}
       SUPERKV_LONG_DURATION_SECONDS: ${{ inputs.duration_seconds || '1800' }}
       SUPERKV_STRESS_MULTIPLIER: ${{ inputs.stress_multiplier || '10' }}
 
@@ -71,7 +73,7 @@ jobs:
           --filter "Category!=LongRunning"
           --no-restore
 
-      - name: Run sustained independent-client load
+      - name: Run sustained Garnet load
         run: >-
           dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release
           --filter "Category=LongRunning"
@@ -81,7 +83,7 @@ jobs:
         run: dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj -c Release --no-restore
 
   benchmark:
-    name: Named Pipe latency benchmark
+    name: Garnet latency benchmark
     if: github.event_name == 'schedule' || inputs.run_benchmarks == true
     runs-on: windows-latest
     timeout-minutes: 180

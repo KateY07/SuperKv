@@ -1,55 +1,53 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using SuperKv;
 
-if (args is ["--child", var childPipe, var childPrefix])
+if (args is ["--child", var childConnectionString, var childPrefix])
 {
-    using SuperKvClient child = Connect(childPipe, childPrefix);
+    using SuperKvClient child = Connect(childConnectionString, childPrefix);
     Assert(Encoding.UTF8.GetString(child.Get("status")!) == "running",
         "The child should see the parent value.");
     child.Set("child", Encoding.UTF8.GetBytes("written"));
     return;
 }
 
-string pipeName = $"SuperKv.Smoke.{Guid.NewGuid():N}";
+int port = GetAvailablePort();
+string connectionString = $"127.0.0.1:{port},connectTimeout=5000,syncTimeout=5000";
 string prefix = $"smoke:{Guid.NewGuid():N}:";
-using var shutdown = new CancellationTokenSource();
-var server = new SuperKvMemoryServer(new SuperKvServerOptions { PipeName = pipeName });
-Task serverTask = Task.Factory.StartNew(
-    () => server.Run(shutdown.Token),
-    CancellationToken.None,
-    TaskCreationOptions.LongRunning,
-    TaskScheduler.Default);
-
-try
+using SuperKvServer server = SuperKvServer.Create(new SuperKvServerOptions
 {
-    using SuperKvClient first = Connect(pipeName, prefix);
-    using SuperKvClient second = Connect(pipeName, prefix);
-    first.Set("status", Encoding.UTF8.GetBytes("running"));
-    Assert(Encoding.UTF8.GetString(second.Get("status")!) == "running",
-        "A second client should see the value.");
+    Port = port,
+    IndexSize = "16m",
+    MemorySize = "64m"
+});
 
-    second.Set("sync", new byte[] { 1, 2, 3 });
-    Assert(first.Get("sync")!.SequenceEqual(new byte[] { 1, 2, 3 }),
-        "Synchronous Get/Set should work across clients.");
+using SuperKvClient first = Connect(connectionString, prefix);
+using SuperKvClient second = Connect(connectionString, prefix);
+first.Set("status", Encoding.UTF8.GetBytes("running"));
+Assert(Encoding.UTF8.GetString(second.Get("status")!) == "running",
+    "A second client should see the value.");
 
-    await RunSecondProcessAsync(pipeName, prefix);
-    Assert(Encoding.UTF8.GetString(first.Get("child")!) == "written",
-        "The parent should see the child process write.");
+second.Set("sync", new byte[] { 1, 2, 3 });
+Assert(first.Get("sync")!.SequenceEqual(new byte[] { 1, 2, 3 }),
+    "Synchronous Get/Set should work across clients.");
 
-    Console.WriteLine("SuperKv Named Pipe cross-process Get/Set smoke tests passed.");
-}
-finally
-{
-    await shutdown.CancelAsync();
-    await serverTask;
-}
+await RunSecondProcessAsync(connectionString, prefix).ConfigureAwait(false);
+Assert(Encoding.UTF8.GetString(first.Get("child")!) == "written",
+    "The parent should see the child process write.");
 
-static SuperKvClient Connect(string pipeName, string prefix) =>
-    SuperKvClient.Connect(new SuperKvOptions { PipeName = pipeName, KeyPrefix = prefix });
+Console.WriteLine("SuperKv Garnet cross-process Get/Set smoke tests passed.");
 
-static async Task RunSecondProcessAsync(string pipeName, string prefix)
+static SuperKvClient Connect(string connectionString, string prefix) =>
+    SuperKvClient.Create(new SuperKvOptions
+    {
+        ConnectionString = connectionString,
+        KeyPrefix = prefix
+    });
+
+static async Task RunSecondProcessAsync(string connectionString, string prefix)
 {
     string processPath = Environment.ProcessPath
         ?? throw new InvalidOperationException("Cannot locate the current process executable.");
@@ -62,19 +60,28 @@ static async Task RunSecondProcessAsync(string pipeName, string prefix)
     if (Path.GetFileNameWithoutExtension(processPath).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
         startInfo.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
     startInfo.ArgumentList.Add("--child");
-    startInfo.ArgumentList.Add(pipeName);
+    startInfo.ArgumentList.Add(connectionString);
     startInfo.ArgumentList.Add(prefix);
 
     using Process child = Process.Start(startInfo)
         ?? throw new InvalidOperationException("Cannot start the child process.");
-    string standardOutput = await child.StandardOutput.ReadToEndAsync();
-    string standardError = await child.StandardError.ReadToEndAsync();
-    await child.WaitForExitAsync();
+    string standardOutput = await child.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+    string standardError = await child.StandardError.ReadToEndAsync().ConfigureAwait(false);
+    await child.WaitForExitAsync().ConfigureAwait(false);
     if (child.ExitCode != 0)
     {
         throw new InvalidOperationException(
             $"Child process failed with exit code {child.ExitCode}.{Environment.NewLine}{standardOutput}{standardError}");
     }
+}
+
+static int GetAvailablePort()
+{
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    listener.Stop();
+    return port;
 }
 
 static void Assert(bool condition, string message)

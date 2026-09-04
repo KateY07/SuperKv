@@ -2,12 +2,14 @@ using SuperKv;
 
 if (args is ["--help"] or ["-h"])
 {
-    Console.WriteLine("Usage: superkv-server [--pipe <name>] [--request-timeout-ms <milliseconds>]");
+    Console.WriteLine("Usage: superkv-server [--address <loopback-ip>] [--port <number>] [--index <size>] [--memory <size>]");
     return;
 }
 
-string pipeName = "SuperKv.Default";
-int requestTimeoutMilliseconds = 30_000;
+string address = "127.0.0.1";
+int port = 6379;
+string indexSize = "16m";
+string memorySize = "1g";
 
 for (int index = 0; index < args.Length; index += 2)
 {
@@ -16,16 +18,23 @@ for (int index = 0; index < args.Length; index += 2)
 
     switch (args[index])
     {
-        case "--pipe":
-            pipeName = args[index + 1];
+        case "--address":
+            address = args[index + 1];
             break;
 
-        case "--request-timeout-ms":
-            if (!int.TryParse(args[index + 1], out requestTimeoutMilliseconds) ||
-                requestTimeoutMilliseconds <= 0)
+        case "--port":
+            if (!int.TryParse(args[index + 1], out port))
             {
-                throw new ArgumentException("--request-timeout-ms must be a positive integer.");
+                throw new ArgumentException("--port must be an integer.");
             }
+            break;
+
+        case "--index":
+            indexSize = args[index + 1];
+            break;
+
+        case "--memory":
+            memorySize = args[index + 1];
             break;
 
         default:
@@ -33,19 +42,19 @@ for (int index = 0; index < args.Length; index += 2)
     }
 }
 
-using var shutdown = new CancellationTokenSource();
+using var stopped = new ManualResetEventSlim();
 Console.CancelKeyPress += (_, eventArgs) =>
 {
     eventArgs.Cancel = true;
-    shutdown.Cancel();
+    stopped.Set();
 };
 
-var server = new SuperKvMemoryServer(new SuperKvServerOptions
+using SuperKvServer server = SuperKvServer.Create(new SuperKvServerOptions
 {
-    PipeName = pipeName,
-    RequestTimeout = TimeSpan.FromMilliseconds(requestTimeoutMilliseconds)
+    Address = address,
+    Port = port,
+    IndexSize = indexSize,
+    MemorySize = memorySize
 });
-Console.WriteLine(
-    $"SuperKv.Server listening on pipe '{pipeName}' with a {requestTimeoutMilliseconds} ms request timeout. " +
-    "Press Ctrl+C to stop.");
-server.Run(shutdown.Token);
+Console.WriteLine($"SuperKv.Server listening at {server.ConnectionString}. Press Ctrl+C to stop.");
+stopped.Wait();
