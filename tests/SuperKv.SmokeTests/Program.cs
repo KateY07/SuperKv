@@ -1,78 +1,56 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
+using Garnet;
 using SuperKv;
 
-if (args is ["--child", var childDirectory])
+if (args is ["--child", var childConnection, var childPrefix])
 {
-    await RunChildProcessAsync(childDirectory);
+    await using ISuperKv child = await OpenAsync(childConnection, childPrefix);
+    Assert(await child.GetStringAsync("status") == "running", "The child should see the parent value.");
+    Assert(await child.IncrementAsync("frames", 2) == 7, "The child should update the shared counter.");
     return;
 }
 
-string directory = Path.Combine(Path.GetTempPath(), "SuperKv.SmokeTests", Guid.NewGuid().ToString("N"));
+int port = GetFreeTcpPort();
+string connectionString = $"127.0.0.1:{port},abortConnect=true,connectTimeout=5000";
+string prefix = $"smoke:{Guid.NewGuid():N}:";
+using var server = new GarnetServer(
+    ["--bind", "127.0.0.1", "--port", port.ToString()]);
+server.Start();
 
-try
-{
-    var options = new SuperKvOptions
+await using ISuperKv first = await OpenAsync(connectionString, prefix);
+await using ISuperKv second = await OpenAsync(connectionString, prefix);
+Assert(await first.SetStringAsync("status", "running"), "Set should succeed.");
+Assert(await second.GetStringAsync("status") == "running", "A second client should see the value.");
+Assert(!await first.SetStringAsync(
+    "status", "stopped", condition: SuperKvSetCondition.OnlyIfMissing),
+    "OnlyIfMissing should reject an existing key.");
+
+await first.SetJsonAsync("camera", new CameraState("exposing", 42));
+Assert(await second.GetJsonAsync<CameraState>("camera") == new CameraState("exposing", 42),
+    "JSON should round-trip.");
+Assert(await first.IncrementAsync("frames") == 1, "A missing counter should start at zero.");
+Assert(await second.IncrementAsync("frames", 4) == 5, "Counters should be shared and atomic.");
+await RunSecondProcessAsync(connectionString, prefix);
+Assert(await first.IncrementAsync("frames", 0) == 7, "The parent should see the child process write.");
+
+await first.SetStringAsync("temporary", "value", TimeSpan.FromMilliseconds(100));
+await WaitUntilAsync(async () => !await second.ExistsAsync("temporary"), TimeSpan.FromSeconds(3));
+Assert(await second.GetStringAsync("temporary") is null, "Expired values should be absent.");
+Assert(await first.DeleteAsync("status"), "Delete should report an existing key.");
+Assert(!await second.ExistsAsync("status"), "Deleted keys should be absent.");
+Console.WriteLine("SuperKv Garnet cross-process smoke tests passed.");
+
+static async ValueTask<ISuperKv> OpenAsync(string connectionString, string prefix) =>
+    await SuperKvClient.OpenAsync(new SuperKvOptions
     {
-        Backend = SuperKvBackend.LightningDb,
-        KeyPrefix = "smoke:",
-        LightningDb = new LightningDbBackendOptions
-        {
-            DirectoryPath = directory,
-            MapSize = 64L * 1024 * 1024
-        }
-    };
+        KeyPrefix = prefix,
+        Garnet = new GarnetOptions { ConnectionString = connectionString }
+    });
 
-    await using ISuperKv first = await SuperKvClient.OpenAsync(options);
-    await using ISuperKv second = await SuperKvClient.OpenAsync(options);
-
-    Assert(await first.SetStringAsync("status", "running"), "Set should succeed.");
-    Assert(await second.GetStringAsync("status") == "running", "A second client should see the value.");
-
-    Assert(!await first.SetStringAsync(
-        "status",
-        "stopped",
-        condition: SuperKvSetCondition.OnlyIfMissing), "OnlyIfMissing should reject an existing key.");
-    Assert(await first.GetStringAsync("status") == "running", "Rejected sets must not change the value.");
-
-    await first.SetJsonAsync("camera", new CameraState("exposing", 42));
-    CameraState? state = await second.GetJsonAsync<CameraState>("camera");
-    Assert(state == new CameraState("exposing", 42), "JSON should round-trip.");
-
-    Assert(await first.IncrementAsync("frames") == 1, "A missing counter should start at zero.");
-    Assert(await second.IncrementAsync("frames", 4) == 5, "Counters should be shared and atomic.");
-
-    await RunSecondProcessAsync(directory);
-    Assert(await first.IncrementAsync("frames", 0) == 7, "The parent should see the child process write.");
-
-    await first.SetStringAsync("temporary", "value", TimeSpan.FromMilliseconds(30));
-    await first.SetStringAsync("stale", "value", TimeSpan.FromMilliseconds(30));
-    await Task.Delay(80);
-    Assert(await second.GetStringAsync("temporary") is null, "Expired values should be hidden.");
-    Assert(!await second.DeleteAsync("stale"), "Deleting a logically expired key should report false.");
-    Assert(await second.SetStringAsync(
-        "temporary",
-        "renewed",
-        condition: SuperKvSetCondition.OnlyIfMissing), "An expired key should count as missing.");
-
-    Assert(await first.DeleteAsync("status"), "Delete should report an existing key.");
-    Assert(!await second.ExistsAsync("status"), "Deleted keys should be absent.");
-
-    Console.WriteLine("SuperKv LightningDB smoke tests passed.");
-}
-finally
-{
-    if (Directory.Exists(directory))
-        Directory.Delete(directory, recursive: true);
-}
-
-static void Assert(bool condition, string message)
-{
-    if (!condition)
-        throw new InvalidOperationException(message);
-}
-
-static async Task RunSecondProcessAsync(string directory)
+static async Task RunSecondProcessAsync(string connectionString, string prefix)
 {
     string processPath = Environment.ProcessPath
         ?? throw new InvalidOperationException("Cannot locate the current process executable.");
@@ -82,40 +60,46 @@ static async Task RunSecondProcessAsync(string directory)
         RedirectStandardError = true,
         UseShellExecute = false
     };
-
     if (Path.GetFileNameWithoutExtension(processPath).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
         startInfo.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
-
     startInfo.ArgumentList.Add("--child");
-    startInfo.ArgumentList.Add(directory);
+    startInfo.ArgumentList.Add(connectionString);
+    startInfo.ArgumentList.Add(prefix);
 
     using Process child = Process.Start(startInfo)
         ?? throw new InvalidOperationException("Cannot start the child process.");
     string standardOutput = await child.StandardOutput.ReadToEndAsync();
     string standardError = await child.StandardError.ReadToEndAsync();
     await child.WaitForExitAsync();
-
     if (child.ExitCode != 0)
         throw new InvalidOperationException(
             $"Child process failed with exit code {child.ExitCode}.{Environment.NewLine}{standardOutput}{standardError}");
 }
 
-static async Task RunChildProcessAsync(string directory)
+static async Task WaitUntilAsync(Func<Task<bool>> predicate, TimeSpan timeout)
 {
-    await using ISuperKv kv = await SuperKvClient.OpenAsync(CreateOptions(directory));
-    Assert(await kv.GetStringAsync("status") == "running", "The child should see the parent process value.");
-    Assert(await kv.IncrementAsync("frames", 2) == 7, "The child should update the shared counter.");
+    DateTime deadline = DateTime.UtcNow + timeout;
+    while (!await predicate())
+    {
+        if (DateTime.UtcNow >= deadline)
+            throw new TimeoutException("Condition was not reached before the timeout.");
+        await Task.Delay(20);
+    }
 }
 
-static SuperKvOptions CreateOptions(string directory) => new()
+static int GetFreeTcpPort()
 {
-    Backend = SuperKvBackend.LightningDb,
-    KeyPrefix = "smoke:",
-    LightningDb = new LightningDbBackendOptions
-    {
-        DirectoryPath = directory,
-        MapSize = 64L * 1024 * 1024
-    }
-};
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    listener.Stop();
+    return port;
+}
+
+static void Assert(bool condition, string message)
+{
+    if (!condition)
+        throw new InvalidOperationException(message);
+}
 
 sealed record CameraState(string Status, long Frame);

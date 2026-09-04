@@ -6,19 +6,22 @@
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Deterministic>true</Deterministic>
 
     <PackageId>SuperKv</PackageId>
     <Version>0.1.0</Version>
     <Authors>SuperKv contributors</Authors>
-    <Description>Low-latency local IPC key-value client with switchable Garnet and LightningDB backends.</Description>
-    <PackageTags>kv;ipc;garnet;redis;lmdb;lightningdb;windows</PackageTags>
+    <Description>Low-latency local IPC key-value client for Garnet and StackExchange.Redis.</Description>
+    <PackageTags>kv;ipc;garnet;redis;resp;windows</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="LightningDB" Version="0.23.0" />
     <PackageReference Include="StackExchange.Redis" Version="3.1.31" />
   </ItemGroup>
 

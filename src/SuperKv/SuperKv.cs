@@ -1,21 +1,8 @@
-using System.Buffers.Binary;
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
-using LightningDB;
 using StackExchange.Redis;
 
 namespace SuperKv;
-
-/// <summary>SuperKv storage backend.</summary>
-public enum SuperKvBackend
-{
-    /// <summary>A local or remote Garnet server accessed through RESP.</summary>
-    Garnet,
-
-    /// <summary>An embedded memory-mapped LMDB database accessed through LightningDB.</summary>
-    LightningDb
-}
 
 /// <summary>Condition applied when setting a key.</summary>
 public enum SuperKvSetCondition
@@ -31,7 +18,7 @@ public enum SuperKvSetCondition
 }
 
 /// <summary>Connection settings for the Garnet backend.</summary>
-public sealed class GarnetBackendOptions
+public sealed class GarnetOptions
 {
     /// <summary>StackExchange.Redis connection string for Garnet.</summary>
     public string ConnectionString { get; init; } = "127.0.0.1:6379,abortConnect=false";
@@ -40,38 +27,41 @@ public sealed class GarnetBackendOptions
     public int Database { get; init; }
 }
 
-/// <summary>Storage settings for the LightningDB backend.</summary>
-public sealed class LightningDbBackendOptions
-{
-    /// <summary>Shared LMDB environment directory. All processes must use the same path.</summary>
-    public string DirectoryPath { get; init; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "SuperKv",
-        "data");
-
-    /// <summary>Maximum memory-map size in bytes. This is address-space reservation, not immediate disk use.</summary>
-    public long MapSize { get; init; } = 1024L * 1024 * 1024;
-}
-
 /// <summary>Configuration used to open a <see cref="SuperKvClient"/>.</summary>
 public sealed class SuperKvOptions
 {
-    /// <summary>Selected backend.</summary>
-    public SuperKvBackend Backend { get; init; } = SuperKvBackend.Garnet;
-
     /// <summary>Prefix prepended to every key, useful for application isolation.</summary>
     public string KeyPrefix { get; init; } = string.Empty;
 
     /// <summary>Garnet connection settings.</summary>
-    public GarnetBackendOptions Garnet { get; init; } = new();
-
-    /// <summary>LightningDB storage settings.</summary>
-    public LightningDbBackendOptions LightningDb { get; init; } = new();
+    public GarnetOptions Garnet { get; init; } = new();
 }
 
 /// <summary>Backend-neutral byte-oriented key-value operations.</summary>
-public interface ISuperKv : IAsyncDisposable
+public interface ISuperKv : IDisposable, IAsyncDisposable
 {
+    /// <summary>Synchronously creates or updates a value. Throws on a thread with a synchronization context.</summary>
+    bool SetValue(
+        string key,
+        ReadOnlyMemory<byte> value,
+        TimeSpan? timeToLive = null,
+        SuperKvSetCondition condition = SuperKvSetCondition.Always);
+
+    /// <summary>Synchronously gets a copy of a value, or <see langword="null"/> when absent.</summary>
+    byte[]? GetValue(string key);
+
+    /// <summary>Synchronously deletes a key and returns whether it existed.</summary>
+    bool Delete(string key);
+
+    /// <summary>Synchronously returns whether a non-expired key exists.</summary>
+    bool Exists(string key);
+
+    /// <summary>Synchronously atomically adds <paramref name="delta"/> to an integer value.</summary>
+    long Increment(string key, long delta = 1);
+
+    /// <summary>Synchronously gets the remaining lifetime.</summary>
+    TimeSpan? GetTimeToLive(string key);
+
     /// <summary>Creates or updates a value.</summary>
     ValueTask<bool> SetAsync(
         string key,
@@ -92,15 +82,11 @@ public interface ISuperKv : IAsyncDisposable
     /// <summary>Atomically adds <paramref name="delta"/> to an integer value.</summary>
     ValueTask<long> IncrementAsync(string key, long delta = 1, CancellationToken cancellationToken = default);
 
-    /// <summary>
-    /// Gets the remaining lifetime. A null result means either that the key is absent or that it has no expiry.
-    /// </summary>
+    /// <summary>Gets the remaining lifetime. Null means absent or no expiry.</summary>
     ValueTask<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default);
 }
 
-/// <summary>
-/// Long-lived, thread-safe SuperKv client. Create one instance per process and reuse it.
-/// </summary>
+/// <summary>Long-lived, thread-safe SuperKv client. Create one instance per process and reuse it.</summary>
 public sealed class SuperKvClient : ISuperKv
 {
     readonly ISuperKvBackend _backend;
@@ -108,7 +94,15 @@ public sealed class SuperKvClient : ISuperKv
 
     SuperKvClient(ISuperKvBackend backend) => _backend = backend;
 
-    /// <summary>Opens the selected backend.</summary>
+    /// <summary>Opens Garnet synchronously.</summary>
+    public static SuperKvClient Open(SuperKvOptions? options = null)
+    {
+        options ??= new SuperKvOptions();
+        ValidateOptions(options);
+        return new SuperKvClient(GarnetBackend.Open(options));
+    }
+
+    /// <summary>Opens Garnet asynchronously.</summary>
     public static async ValueTask<SuperKvClient> OpenAsync(
         SuperKvOptions? options = null,
         CancellationToken cancellationToken = default)
@@ -116,14 +110,61 @@ public sealed class SuperKvClient : ISuperKv
         options ??= new SuperKvOptions();
         ValidateOptions(options);
 
-        ISuperKvBackend backend = options.Backend switch
-        {
-            SuperKvBackend.Garnet => await GarnetBackend.OpenAsync(options, cancellationToken).ConfigureAwait(false),
-            SuperKvBackend.LightningDb => LightningDbBackend.Open(options, cancellationToken),
-            _ => throw new ArgumentOutOfRangeException(nameof(options), options.Backend, "Unknown backend.")
-        };
-
+        ISuperKvBackend backend = await GarnetBackend.OpenAsync(options, cancellationToken).ConfigureAwait(false);
         return new SuperKvClient(backend);
+    }
+
+    /// <inheritdoc />
+    public bool SetValue(
+        string key,
+        ReadOnlyMemory<byte> value,
+        TimeSpan? timeToLive = null,
+        SuperKvSetCondition condition = SuperKvSetCondition.Always)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        ValidateTimeToLive(timeToLive);
+        return _backend.SetValue(key, value, timeToLive, condition);
+    }
+
+    /// <inheritdoc />
+    public byte[]? GetValue(string key)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        return _backend.GetValue(key);
+    }
+
+    /// <inheritdoc />
+    public bool Delete(string key)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        return _backend.Delete(key);
+    }
+
+    /// <inheritdoc />
+    public bool Exists(string key)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        return _backend.Exists(key);
+    }
+
+    /// <inheritdoc />
+    public long Increment(string key, long delta = 1)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        return _backend.Increment(key, delta);
+    }
+
+    /// <inheritdoc />
+    public TimeSpan? GetTimeToLive(string key)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        return _backend.GetTimeToLive(key);
     }
 
     /// <inheritdoc />
@@ -186,38 +227,38 @@ public sealed class SuperKvClient : ISuperKv
     }
 
     /// <inheritdoc />
+    public void Dispose()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            _backend.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
         await _backend.DisposeAsync().ConfigureAwait(false);
+        GC.SuppressFinalize(this);
     }
 
     static void ValidateOptions(SuperKvOptions options)
     {
         ArgumentNullException.ThrowIfNull(options.Garnet);
-        ArgumentNullException.ThrowIfNull(options.LightningDb);
 
         if (options.KeyPrefix is null)
             throw new ArgumentException("KeyPrefix cannot be null.", nameof(options));
 
-        if (options.Backend == SuperKvBackend.Garnet && string.IsNullOrWhiteSpace(options.Garnet.ConnectionString))
+        if (string.IsNullOrWhiteSpace(options.Garnet.ConnectionString))
             throw new ArgumentException("A Garnet connection string is required.", nameof(options));
-
-        if (options.Backend == SuperKvBackend.LightningDb)
-        {
-            if (string.IsNullOrWhiteSpace(options.LightningDb.DirectoryPath))
-                throw new ArgumentException("A LightningDB directory is required.", nameof(options));
-            if (options.LightningDb.MapSize <= 0)
-                throw new ArgumentOutOfRangeException(nameof(options), "LightningDB MapSize must be positive.");
-        }
     }
 
-    static void ValidateKey(string key)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-    }
+    static void ValidateKey(string key) => ArgumentException.ThrowIfNullOrEmpty(key);
 
     static void ValidateTimeToLive(TimeSpan? timeToLive)
     {
@@ -231,6 +272,52 @@ public sealed class SuperKvClient : ISuperKv
 /// <summary>Convenience operations for strings and JSON values.</summary>
 public static class SuperKvExtensions
 {
+    /// <summary>Synchronously stores a UTF-8 string.</summary>
+    public static bool SetString(
+        this ISuperKv kv,
+        string key,
+        string value,
+        TimeSpan? timeToLive = null,
+        SuperKvSetCondition condition = SuperKvSetCondition.Always)
+    {
+        ArgumentNullException.ThrowIfNull(kv);
+        ArgumentNullException.ThrowIfNull(value);
+        return kv.SetValue(key, Encoding.UTF8.GetBytes(value), timeToLive, condition);
+    }
+
+    /// <summary>Synchronously gets a UTF-8 string.</summary>
+    public static string? GetString(this ISuperKv kv, string key)
+    {
+        ArgumentNullException.ThrowIfNull(kv);
+        byte[]? value = kv.GetValue(key);
+        return value is null ? null : Encoding.UTF8.GetString(value);
+    }
+
+    /// <summary>Synchronously serializes and stores a JSON value.</summary>
+    public static bool SetJson<T>(
+        this ISuperKv kv,
+        string key,
+        T value,
+        TimeSpan? timeToLive = null,
+        SuperKvSetCondition condition = SuperKvSetCondition.Always,
+        JsonSerializerOptions? serializerOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(kv);
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(value, serializerOptions);
+        return kv.SetValue(key, json, timeToLive, condition);
+    }
+
+    /// <summary>Synchronously gets and deserializes a JSON value.</summary>
+    public static T? GetJson<T>(
+        this ISuperKv kv,
+        string key,
+        JsonSerializerOptions? serializerOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(kv);
+        byte[]? json = kv.GetValue(key);
+        return json is null ? default : JsonSerializer.Deserialize<T>(json, serializerOptions);
+    }
+
     /// <summary>Stores a UTF-8 string.</summary>
     public static ValueTask<bool> SetStringAsync(
         this ISuperKv kv,
@@ -284,8 +371,15 @@ public static class SuperKvExtensions
     }
 }
 
-interface ISuperKvBackend : IAsyncDisposable
+interface ISuperKvBackend : IDisposable, IAsyncDisposable
 {
+    bool SetValue(string key, ReadOnlyMemory<byte> value, TimeSpan? timeToLive, SuperKvSetCondition condition);
+    byte[]? GetValue(string key);
+    bool Delete(string key);
+    bool Exists(string key);
+    long Increment(string key, long delta);
+    TimeSpan? GetTimeToLive(string key);
+
     ValueTask<bool> SetAsync(
         string key,
         ReadOnlyMemory<byte> value,
@@ -313,6 +407,9 @@ sealed class GarnetBackend : ISuperKvBackend
         _keyPrefix = keyPrefix;
     }
 
+    public static GarnetBackend Open(SuperKvOptions options) =>
+        new(ConnectionMultiplexer.Connect(options.Garnet.ConnectionString), options.Garnet.Database, options.KeyPrefix);
+
     public static async ValueTask<GarnetBackend> OpenAsync(
         SuperKvOptions options,
         CancellationToken cancellationToken)
@@ -324,6 +421,27 @@ sealed class GarnetBackend : ISuperKvBackend
         return new GarnetBackend(connection, options.Garnet.Database, options.KeyPrefix);
     }
 
+    public bool SetValue(
+        string key,
+        ReadOnlyMemory<byte> value,
+        TimeSpan? timeToLive,
+        SuperKvSetCondition condition) =>
+        _database.StringSet(FormatKey(key), value.ToArray(), timeToLive, MapCondition(condition));
+
+    public byte[]? GetValue(string key)
+    {
+        RedisValue value = _database.StringGet(FormatKey(key));
+        return value.IsNull ? null : (byte[]?)value;
+    }
+
+    public bool Delete(string key) => _database.KeyDelete(FormatKey(key));
+
+    public bool Exists(string key) => _database.KeyExists(FormatKey(key));
+
+    public long Increment(string key, long delta) => _database.StringIncrement(FormatKey(key), delta);
+
+    public TimeSpan? GetTimeToLive(string key) => _database.KeyTimeToLive(FormatKey(key));
+
     public async ValueTask<bool> SetAsync(
         string key,
         ReadOnlyMemory<byte> value,
@@ -331,19 +449,11 @@ sealed class GarnetBackend : ISuperKvBackend
         SuperKvSetCondition condition,
         CancellationToken cancellationToken)
     {
-        When when = condition switch
-        {
-            SuperKvSetCondition.Always => When.Always,
-            SuperKvSetCondition.OnlyIfMissing => When.NotExists,
-            SuperKvSetCondition.OnlyIfPresent => When.Exists,
-            _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "Unknown set condition.")
-        };
-
         Task<bool> operation = _database.StringSetAsync(
             FormatKey(key),
             value.ToArray(),
             timeToLive,
-            when);
+            MapCondition(condition));
         return await operation.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -374,270 +484,17 @@ sealed class GarnetBackend : ISuperKvBackend
             .WaitAsync(cancellationToken)
             .ConfigureAwait(false);
 
+    public void Dispose() => _connection.Dispose();
+
     public async ValueTask DisposeAsync() => await _connection.DisposeAsync().ConfigureAwait(false);
 
+    static When MapCondition(SuperKvSetCondition condition) => condition switch
+    {
+        SuperKvSetCondition.Always => When.Always,
+        SuperKvSetCondition.OnlyIfMissing => When.NotExists,
+        SuperKvSetCondition.OnlyIfPresent => When.Exists,
+        _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "Unknown set condition.")
+    };
+
     RedisKey FormatKey(string key) => _keyPrefix + key;
-}
-
-sealed class LightningDbBackend : ISuperKvBackend
-{
-    const int HeaderLength = 12;
-    const uint EnvelopeMagic = 0x31564B53; // "SKV1" in little endian
-    const int MaxLmdbKeyBytes = 511;
-
-    readonly LightningEnvironment _environment;
-    readonly byte[] _keyPrefix;
-
-    LightningDbBackend(LightningEnvironment environment, string keyPrefix)
-    {
-        _environment = environment;
-        _keyPrefix = Encoding.UTF8.GetBytes(keyPrefix);
-    }
-
-    public static LightningDbBackend Open(SuperKvOptions options, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        string path = Path.GetFullPath(options.LightningDb.DirectoryPath);
-        Directory.CreateDirectory(path);
-
-        var configuration = new EnvironmentConfiguration { MapSize = options.LightningDb.MapSize };
-        var environment = new LightningEnvironment(path, configuration);
-
-        try
-        {
-            environment.Open();
-            using var transaction = environment.BeginTransaction();
-            using var database = transaction.OpenDatabase(
-                configuration: new DatabaseConfiguration { Flags = DatabaseOpenFlags.Create });
-            transaction.Commit();
-            return new LightningDbBackend(environment, options.KeyPrefix);
-        }
-        catch
-        {
-            environment.Dispose();
-            throw;
-        }
-    }
-
-    public ValueTask<bool> SetAsync(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive,
-        SuperKvSetCondition condition,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-        byte[] envelope = CreateEnvelope(value.Span, timeToLive);
-
-        using var transaction = _environment.BeginTransaction();
-        using var database = transaction.OpenDatabase();
-
-        var (resultCode, _, existingValue) = transaction.Get(database, encodedKey);
-        bool exists = resultCode == MDBResultCode.Success && !IsExpired(ReadExpiration(existingValue.AsSpan()));
-        bool shouldWrite = condition switch
-        {
-            SuperKvSetCondition.Always => true,
-            SuperKvSetCondition.OnlyIfMissing => !exists,
-            SuperKvSetCondition.OnlyIfPresent => exists,
-            _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "Unknown set condition.")
-        };
-
-        if (!shouldWrite)
-            return ValueTask.FromResult(false);
-
-        transaction.Put(database, encodedKey, envelope);
-        transaction.Commit();
-        return ValueTask.FromResult(true);
-    }
-
-    public ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-        byte[]? result;
-        bool expired;
-
-        using (var transaction = _environment.BeginTransaction(TransactionBeginFlags.ReadOnly))
-        using (var database = transaction.OpenDatabase())
-        {
-            var (resultCode, _, value) = transaction.Get(database, encodedKey);
-            if (resultCode != MDBResultCode.Success)
-                return ValueTask.FromResult<byte[]?>(null);
-
-            ReadOnlySpan<byte> envelope = value.AsSpan();
-            expired = IsExpired(ReadExpiration(envelope));
-            result = expired ? null : envelope[HeaderLength..].ToArray();
-        }
-
-        if (expired)
-            DeleteIfExpired(encodedKey);
-
-        return ValueTask.FromResult(result);
-    }
-
-    public ValueTask<bool> DeleteAsync(string key, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-
-        using var transaction = _environment.BeginTransaction();
-        using var database = transaction.OpenDatabase();
-        var (resultCode, _, value) = transaction.Get(database, encodedKey);
-        bool existed = resultCode == MDBResultCode.Success && !IsExpired(ReadExpiration(value.AsSpan()));
-        if (resultCode == MDBResultCode.Success)
-            transaction.Delete(database, encodedKey);
-        transaction.Commit();
-        return ValueTask.FromResult(existed);
-    }
-
-    public ValueTask<bool> ExistsAsync(string key, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-        bool exists;
-        bool expired = false;
-
-        using (var transaction = _environment.BeginTransaction(TransactionBeginFlags.ReadOnly))
-        using (var database = transaction.OpenDatabase())
-        {
-            var (resultCode, _, value) = transaction.Get(database, encodedKey);
-            exists = resultCode == MDBResultCode.Success;
-            if (exists)
-            {
-                expired = IsExpired(ReadExpiration(value.AsSpan()));
-                exists = !expired;
-            }
-        }
-
-        if (expired)
-            DeleteIfExpired(encodedKey);
-
-        return ValueTask.FromResult(exists);
-    }
-
-    public ValueTask<long> IncrementAsync(
-        string key,
-        long delta,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-
-        using var transaction = _environment.BeginTransaction();
-        using var database = transaction.OpenDatabase();
-        var (resultCode, _, value) = transaction.Get(database, encodedKey);
-
-        long current = 0;
-        long expiration = 0;
-        if (resultCode == MDBResultCode.Success)
-        {
-            ReadOnlySpan<byte> envelope = value.AsSpan();
-            expiration = ReadExpiration(envelope);
-            if (!IsExpired(expiration))
-            {
-                string text = Encoding.UTF8.GetString(envelope[HeaderLength..]);
-                if (!long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out current))
-                    throw new InvalidOperationException($"Value at key '{key}' is not a 64-bit integer.");
-            }
-            else
-            {
-                expiration = 0;
-            }
-        }
-
-        long updated = checked(current + delta);
-        byte[] payload = Encoding.UTF8.GetBytes(updated.ToString(CultureInfo.InvariantCulture));
-        byte[] updatedEnvelope = CreateEnvelope(payload, expiration);
-        transaction.Put(database, encodedKey, updatedEnvelope);
-        transaction.Commit();
-        return ValueTask.FromResult(updated);
-    }
-
-    public ValueTask<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        byte[] encodedKey = EncodeKey(key);
-        long expiration;
-
-        using (var transaction = _environment.BeginTransaction(TransactionBeginFlags.ReadOnly))
-        using (var database = transaction.OpenDatabase())
-        {
-            var (resultCode, _, value) = transaction.Get(database, encodedKey);
-            if (resultCode != MDBResultCode.Success)
-                return ValueTask.FromResult<TimeSpan?>(null);
-
-            expiration = ReadExpiration(value.AsSpan());
-        }
-
-        if (expiration == 0)
-            return ValueTask.FromResult<TimeSpan?>(null);
-
-        long remainingTicks = expiration - DateTime.UtcNow.Ticks;
-        if (remainingTicks <= 0)
-        {
-            DeleteIfExpired(encodedKey);
-            return ValueTask.FromResult<TimeSpan?>(null);
-        }
-
-        return ValueTask.FromResult<TimeSpan?>(TimeSpan.FromTicks(remainingTicks));
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        _environment.Dispose();
-        return ValueTask.CompletedTask;
-    }
-
-    byte[] EncodeKey(string key)
-    {
-        int keyByteCount = Encoding.UTF8.GetByteCount(key);
-        int length = checked(_keyPrefix.Length + keyByteCount);
-        if (length > MaxLmdbKeyBytes)
-            throw new ArgumentException($"The UTF-8 key and prefix cannot exceed {MaxLmdbKeyBytes} bytes.", nameof(key));
-
-        byte[] encoded = GC.AllocateUninitializedArray<byte>(length);
-        _keyPrefix.CopyTo(encoded, 0);
-        Encoding.UTF8.GetBytes(key, encoded.AsSpan(_keyPrefix.Length));
-        return encoded;
-    }
-
-    void DeleteIfExpired(byte[] encodedKey)
-    {
-        using var transaction = _environment.BeginTransaction();
-        using var database = transaction.OpenDatabase();
-        var (resultCode, _, value) = transaction.Get(database, encodedKey);
-        if (resultCode == MDBResultCode.Success && IsExpired(ReadExpiration(value.AsSpan())))
-        {
-            transaction.Delete(database, encodedKey);
-            transaction.Commit();
-        }
-    }
-
-    static byte[] CreateEnvelope(ReadOnlySpan<byte> payload, TimeSpan? timeToLive)
-    {
-        long expiration = timeToLive is { } ttl
-            ? DateTime.UtcNow.Add(ttl).Ticks
-            : 0;
-        return CreateEnvelope(payload, expiration);
-    }
-
-    static byte[] CreateEnvelope(ReadOnlySpan<byte> payload, long expiration)
-    {
-        byte[] envelope = GC.AllocateUninitializedArray<byte>(checked(HeaderLength + payload.Length));
-        BinaryPrimitives.WriteUInt32LittleEndian(envelope, EnvelopeMagic);
-        BinaryPrimitives.WriteInt64LittleEndian(envelope.AsSpan(sizeof(uint)), expiration);
-        payload.CopyTo(envelope.AsSpan(HeaderLength));
-        return envelope;
-    }
-
-    static long ReadExpiration(ReadOnlySpan<byte> envelope)
-    {
-        if (envelope.Length < HeaderLength || BinaryPrimitives.ReadUInt32LittleEndian(envelope) != EnvelopeMagic)
-            throw new InvalidDataException("The LightningDB value is not in the SuperKv v1 format.");
-
-        return BinaryPrimitives.ReadInt64LittleEndian(envelope[sizeof(uint)..]);
-    }
-
-    static bool IsExpired(long expiration) => expiration != 0 && expiration <= DateTime.UtcNow.Ticks;
 }

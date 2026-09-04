@@ -1,0 +1,110 @@
+name: Long test matrix
+
+on:
+  schedule:
+    - cron: '17 19 * * 6'
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Sustained-load duration for each matrix job
+        required: true
+        default: '120'
+        type: string
+      stress_multiplier:
+        description: Multiplier for regular concurrency-test operation counts
+        required: true
+        default: '10'
+        type: string
+      benchmark_job:
+        description: BenchmarkDotNet job length
+        required: true
+        default: medium
+        type: choice
+        options: [short, medium, long]
+      run_benchmarks:
+        description: Run the latency benchmark job
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  stress:
+    name: Stress - ${{ matrix.sdk }} SDK - ${{ matrix.clients }} clients
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        sdk: [8.0.x, 10.0.x]
+        clients: [1, 8, 32]
+    env:
+      SUPERKV_LONG_TESTS: 1
+      SUPERKV_LONG_CLIENTS: ${{ matrix.clients }}
+      SUPERKV_LONG_DURATION_SECONDS: ${{ inputs.duration_seconds || '120' }}
+      SUPERKV_STRESS_MULTIPLIER: ${{ inputs.stress_multiplier || '10' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Restore test projects
+        run: |
+          dotnet restore tests/SuperKv.Tests/SuperKv.Tests.csproj
+          dotnet restore tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj
+
+      - name: Run amplified concurrency suite
+        run: >-
+          dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release
+          --filter "Category!=LongRunning"
+          --no-restore
+
+      - name: Run sustained independent-client load
+        run: >-
+          dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release
+          --filter "Category=LongRunning"
+          --no-build --no-restore
+
+      - name: Run cross-process smoke test
+        run: dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj -c Release --no-restore
+
+  benchmark:
+    name: Garnet latency benchmark
+    if: github.event_name == 'schedule' || inputs.run_benchmarks == true
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      SUPERKV_BENCHMARK_JOB: ${{ inputs.benchmark_job || 'medium' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run all latency benchmarks
+        run: dotnet run --project benchmarks/SuperKv.Benchmarks/SuperKv.Benchmarks.csproj -c Release -- --filter '*'
+
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SuperKv-benchmark-${{ github.sha }}
+          path: BenchmarkDotNet.Artifacts/results/*
+          if-no-files-found: warn
+          retention-days: 90

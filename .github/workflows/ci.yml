@@ -1,0 +1,84 @@
+name: CI and NuGet package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  verify-and-pack:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install .NET SDKs
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore SuperKv.slnx
+
+      - name: Verify formatting and analyzers
+        run: dotnet format SuperKv.slnx --verify-no-changes --no-restore
+
+      - name: Build with warnings as errors
+        run: dotnet build SuperKv.slnx -c Release --no-restore
+
+      - name: Run contract, edge, and concurrency tests with coverage
+        run: >-
+          dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release --no-build
+          --filter "Category!=LongRunning"
+          /p:CollectCoverage=true
+          /p:CoverletOutput=../../TestResults/coverage.cobertura.xml
+          /p:CoverletOutputFormat=cobertura
+          /p:Include="[SuperKv]*"
+          /p:Exclude="[SuperKv.Tests]*"
+
+      - name: Enforce coverage floor
+        shell: pwsh
+        run: |
+          [xml]$report = Get-Content '${{ github.workspace }}/TestResults/coverage.cobertura.xml'
+          $line = [double]$report.coverage.'line-rate'
+          $branch = [double]$report.coverage.'branch-rate'
+          if ($line -lt 0.90 -or $branch -lt 0.90) {
+            throw "Coverage below floor: line=$($line * 100)%, branch=$($branch * 100)%"
+          }
+          "Line coverage: $($line * 100)%; branch coverage: $($branch * 100)%" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Run cross-process smoke test
+        run: dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj -c Release --no-build
+
+      - name: Build NuGet package
+        run: dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:ContinuousIntegrationBuild=true
+
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@v7
+        with:
+          name: SuperKv-nuget-${{ github.sha }}
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SuperKv-coverage-${{ github.sha }}
+          path: TestResults/coverage.cobertura.xml
+          if-no-files-found: warn
+          retention-days: 30

@@ -2,7 +2,11 @@
   <Folder Name="/src/">
     <Project Path="src/SuperKv/SuperKv.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/SuperKv.Benchmarks/SuperKv.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj" />
+    <Project Path="tests/SuperKv.Tests/SuperKv.Tests.csproj" />
   </Folder>
 </Solution>
