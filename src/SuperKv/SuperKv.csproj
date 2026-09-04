@@ -13,14 +13,18 @@
     <Deterministic>true</Deterministic>
 
     <PackageId>SuperKv</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>SuperKv contributors</Authors>
-    <Description>Low-latency local IPC key-value engine using Named Pipes and ConcurrentDictionary.</Description>
-    <PackageTags>kv;ipc;named-pipe;concurrentdictionary;memory;windows</PackageTags>
+    <Description>Low-latency local IPC key-value client with memory and Garnet backends.</Description>
+    <PackageTags>kv;ipc;named-pipe;concurrentdictionary;memory;garnet;redis;windows</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="3.1.31" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />

@@ -1,6 +1,6 @@
 # 测试与性能验证
 
-SuperKv 的客户端、服务端、协议和存储实现集中在一个 SuperKv.cs。测试围绕同步 Get/Set、Named Pipe 边界和多进程共享语义展开。
+SuperKv 的客户端、内存服务端和协议实现集中在一个 SuperKv.cs。测试围绕同步 Get/Set、Named Pipe 边界、Garnet 兼容性和多进程共享语义展开。
 
 ## 覆盖范围
 
@@ -14,6 +14,7 @@ SuperKv 的客户端、服务端、协议和存储实现集中在一个 SuperKv.
 | 不完整命令 | 合法长度头后停发，单帧超时关闭该连接，健康客户端继续工作 |
 | 多进程 | 父进程启动服务，真实子进程读写同一份内存数据 |
 | 同步上下文 | API 在不泵送的自定义 SynchronizationContext 中完成 |
+| Garnet 集成 | 启动真实 Garnet，验证缺失键、空值、二进制值、覆盖、共享前缀和同客户端并发 |
 | 性能 | BenchmarkDotNet 测量同步 Get/Set，覆盖 16 B 至 64 KiB 值 |
 | 长时压力 | 1/8/32 客户端，循环 0 B 至 1 MiB 边界值、冷热键和读写校验 |
 
@@ -34,11 +35,11 @@ SuperKv 的客户端、服务端、协议和存储实现集中在一个 SuperKv.
       "/p:Include=[SuperKv]*" \
       "/p:Exclude=[SuperKv.Tests]*"
 
-当前快速套件实测：行覆盖率 98.17%、分支覆盖率 93.10%、方法覆盖率 100%。CI 门槛为行 90%、分支 90%。
+当前快速套件实测：行覆盖率 97.08%、分支覆盖率 92.10%、方法覆盖率 100%。CI 门槛为行 90%、分支 90%。
 
 ## GitHub Actions
 
-- CI and NuGet package：每次推送和拉取请求运行格式、静态分析、构建、快速测试、覆盖率、跨进程测试，并生成 SuperKv 与 SuperKv.Server 两个 NuGet 包。
+- CI and NuGet package：每次推送和拉取请求运行格式、静态分析、构建、快速测试、覆盖率、跨进程测试，并只生成一个 SuperKv NuGet 包。
 - Long test matrix：每周或手动执行 .NET 8/10 SDK × 1/8/32 客户端矩阵；默认每个持续测试运行 1800 秒。
 - 长工作流另外运行同步 Get/Set 的 BenchmarkDotNet 延迟基准并上传报告。
 

@@ -5,18 +5,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <PackAsTool>true</PackAsTool>
-    <ToolCommandName>superkv-server</ToolCommandName>
-    <PackageId>SuperKv.Server</PackageId>
-    <Version>0.1.0</Version>
-    <Authors>SuperKv contributors</Authors>
-    <Description>Explicit Named Pipe server for SuperKv.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../SuperKv/SuperKv.csproj" />
-    <None Include="../../README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 </Project>

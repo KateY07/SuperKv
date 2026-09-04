@@ -32,8 +32,17 @@ public sealed class SuperKvEdgeTests
     [Fact]
     public void OptionsAndKeysAreValidated()
     {
+        Assert.Equal(SuperKvBackend.Memory, new SuperKvOptions().Backend);
         Assert.Throws<ArgumentException>(() => SuperKvClient.Connect(
             new SuperKvOptions { PipeName = " " }));
+        Assert.Throws<ArgumentException>(() => SuperKvClient.Connect(
+            new SuperKvOptions
+            {
+                Backend = SuperKvBackend.Garnet,
+                GarnetConnectionString = " "
+            }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => SuperKvClient.Connect(
+            new SuperKvOptions { Backend = (SuperKvBackend)42 }));
         Assert.ThrowsAny<ArgumentException>(() => SuperKvClient.Connect(
             new SuperKvOptions { KeyPrefix = null! }));
         Assert.Throws<ArgumentOutOfRangeException>(() => SuperKvClient.Connect(

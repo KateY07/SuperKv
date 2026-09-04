@@ -3,12 +3,23 @@ using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Text;
+using StackExchange.Redis;
 
 namespace SuperKv;
 
+public enum SuperKvBackend
+{
+    Memory,
+    Garnet
+}
+
 public sealed class SuperKvOptions
 {
+    public SuperKvBackend Backend { get; init; } = SuperKvBackend.Memory;
+
     public string PipeName { get; init; } = "SuperKv.Default";
+
+    public string GarnetConnectionString { get; init; } = "127.0.0.1:6379";
 
     public string KeyPrefix { get; init; } = string.Empty;
 
@@ -24,18 +35,29 @@ public sealed class SuperKvServerOptions
 
 public sealed class SuperKvClient : IDisposable
 {
+    readonly SuperKvBackend _backend;
     readonly string _pipeName;
+    readonly string _garnetConnectionString;
     readonly string _keyPrefix;
     readonly int _connectTimeoutMilliseconds;
     readonly SemaphoreSlim _pipeGate = new(1, 1);
     NamedPipeClientStream? _pipe;
+    ConnectionMultiplexer? _garnetConnection;
+    IDatabase? _garnetDatabase;
     int _disposed;
 
     SuperKvClient(SuperKvOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.PipeName);
         ArgumentNullException.ThrowIfNull(options.KeyPrefix);
+
+        if (!Enum.IsDefined(options.Backend))
+            throw new ArgumentOutOfRangeException(nameof(options), "Unsupported SuperKv backend.");
+
+        if (options.Backend == SuperKvBackend.Memory)
+            ArgumentException.ThrowIfNullOrWhiteSpace(options.PipeName);
+        else
+            ArgumentException.ThrowIfNullOrWhiteSpace(options.GarnetConnectionString);
 
         if (options.ConnectTimeout <= TimeSpan.Zero ||
             options.ConnectTimeout.TotalMilliseconds > int.MaxValue)
@@ -45,7 +67,9 @@ public sealed class SuperKvClient : IDisposable
                 "ConnectTimeout must be greater than zero and at most Int32.MaxValue milliseconds.");
         }
 
+        _backend = options.Backend;
         _pipeName = options.PipeName;
+        _garnetConnectionString = options.GarnetConnectionString;
         _keyPrefix = options.KeyPrefix;
         _connectTimeoutMilliseconds = checked((int)Math.Ceiling(options.ConnectTimeout.TotalMilliseconds));
     }
@@ -53,6 +77,21 @@ public sealed class SuperKvClient : IDisposable
     public static SuperKvClient Connect(SuperKvOptions? options = null)
     {
         var client = new SuperKvClient(options ?? new SuperKvOptions());
+
+        if (client._backend == SuperKvBackend.Garnet)
+        {
+            try
+            {
+                client.ConnectGarnet();
+                return client;
+            }
+            catch
+            {
+                client.Dispose();
+                throw;
+            }
+        }
+
         var pipe = client.CreatePipe();
 
         try
@@ -78,6 +117,15 @@ public sealed class SuperKvClient : IDisposable
     public void Set(string key, ReadOnlyMemory<byte> value)
     {
         string qualifiedKey = QualifyKey(key);
+
+        if (_backend == SuperKvBackend.Garnet)
+        {
+            bool stored = GetGarnetDatabase().StringSet(qualifiedKey, value.ToArray());
+            if (!stored)
+                throw new IOException("Garnet did not acknowledge the SET command.");
+            return;
+        }
+
         byte[] request = SuperKvProtocol.CreateSetRequest(qualifiedKey, value.Span);
         Execute(request, static response =>
         {
@@ -89,6 +137,13 @@ public sealed class SuperKvClient : IDisposable
     public byte[]? Get(string key)
     {
         string qualifiedKey = QualifyKey(key);
+
+        if (_backend == SuperKvBackend.Garnet)
+        {
+            RedisValue value = GetGarnetDatabase().StringGet(qualifiedKey);
+            return value.IsNull ? null : (byte[]?)value;
+        }
+
         byte[] request = SuperKvProtocol.CreateGetRequest(qualifiedKey);
         return Execute(request, SuperKvProtocol.ReadGetResponse);
     }
@@ -100,7 +155,28 @@ public sealed class SuperKvClient : IDisposable
 
         NamedPipeClientStream? pipe = Interlocked.Exchange(ref _pipe, null);
         pipe?.Dispose();
+        ConnectionMultiplexer? garnetConnection = Interlocked.Exchange(ref _garnetConnection, null);
+        _garnetDatabase = null;
+        garnetConnection?.Dispose();
         _pipeGate.Dispose();
+    }
+
+    void ConnectGarnet()
+    {
+        ConfigurationOptions configuration = ConfigurationOptions.Parse(_garnetConnectionString);
+        configuration.AbortOnConnectFail = true;
+        configuration.ConnectRetry = 0;
+        configuration.ConnectTimeout = _connectTimeoutMilliseconds;
+
+        ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
+        _garnetConnection = connection;
+        _garnetDatabase = connection.GetDatabase();
+    }
+
+    IDatabase GetGarnetDatabase()
+    {
+        ThrowIfDisposed();
+        return _garnetDatabase ?? throw new IOException("The Garnet connection is closed.");
     }
 
 

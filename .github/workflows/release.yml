@@ -57,9 +57,7 @@ jobs:
 
       - name: Pack NuGet packages
         shell: pwsh
-        run: |
-          dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:PackageVersion=$env:PACKAGE_VERSION -p:ContinuousIntegrationBuild=true
-          dotnet pack src/SuperKv.Server/SuperKv.Server.csproj -c Release --no-build -o artifacts -p:PackageVersion=$env:PACKAGE_VERSION -p:ContinuousIntegrationBuild=true
+        run: dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:PackageVersion=$env:PACKAGE_VERSION -p:ContinuousIntegrationBuild=true
 
       - name: Generate checksums
         shell: pwsh
