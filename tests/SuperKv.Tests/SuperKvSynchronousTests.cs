@@ -72,5 +72,49 @@ public sealed class SuperKvSynchronousTests
         Assert.Throws<ObjectDisposedException>(() => kv.GetValue("key"));
     }
 
+    [Fact]
+    public async Task SynchronousApiDoesNotDependOnSynchronizationContext()
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(new NonPumpingSynchronizationContext());
+            try
+            {
+                using ISuperKv kv = SuperKvClient.Open(new SuperKvOptions
+                {
+                    KeyPrefix = $"sync-context:{Guid.NewGuid():N}:",
+                    Garnet = new GarnetOptions { ConnectionString = _garnet.ConnectionString }
+                });
+
+                Assert.True(kv.SetString("key", "value"));
+                Assert.Equal("value", kv.GetString("key"));
+                Assert.Equal(1, kv.Increment("counter"));
+                completion.SetResult(true);
+            }
+            catch (Exception exception)
+            {
+                completion.SetException(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "SuperKv sync-context test"
+        };
+
+        thread.Start();
+        Assert.True(await completion.Task.WaitAsync(TimeSpan.FromSeconds(15)));
+        Assert.True(thread.Join(TimeSpan.FromSeconds(1)));
+    }
+
+    sealed class NonPumpingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+        }
+
+        public override void Send(SendOrPostCallback callback, object? state) =>
+            throw new InvalidOperationException("Synchronous API attempted to use the synchronization context.");
+    }
     sealed record CameraState(string Status, long Frame);
 }

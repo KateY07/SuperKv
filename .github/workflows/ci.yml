@@ -36,6 +36,17 @@ jobs:
       - name: Verify formatting and analyzers
         run: dotnet format SuperKv.slnx --verify-no-changes --no-restore
 
+      - name: Reject async-over-sync deadlock patterns
+        shell: pwsh
+        run: |
+          $source = Get-Content 'src/SuperKv/SuperKv.cs' -Raw
+          $forbidden = @('.Result', '.Wait(', 'GetAwaiter().GetResult(')
+          foreach ($pattern in $forbidden) {
+            if ($source.Contains($pattern, [StringComparison]::Ordinal)) {
+              throw "Forbidden async-over-sync pattern found: $pattern"
+            }
+          }
+
       - name: Build with warnings as errors
         run: dotnet build SuperKv.slnx -c Release --no-restore
 
