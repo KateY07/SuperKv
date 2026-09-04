@@ -1,93 +1,76 @@
 # SuperKv
 
-SuperKv 是一个面向本机多进程 IPC 的轻量 C# KV NuGet 库：
+SuperKv 是一个 Windows 本机多进程内存 KV：
 
-```text
-多个 C# 进程
-    ↓ SuperKv / StackExchange.Redis
-127.0.0.1:6379
-    ↓
-GarnetServer.exe
-```
+    多个 C# 客户端进程
+            ↓ 每个客户端一条持久 Named Pipe
+    明确启动的 SuperKv.Server
+            ↓
+    ConcurrentDictionary<string, byte[]>
 
-SuperKv 只封装 Garnet 常用 KV 操作，目标框架为 .NET 8。原始值使用 `byte[]`，并提供 UTF-8 字符串和 `System.Text.Json` 扩展。
+它不依赖 Garnet、Redis、数据库或第三方运行时包。服务端不持久化，重启后数据清空。核心客户端、服务端、协议和存储实现全部位于单个 src/SuperKv/SuperKv.cs 文件。
 
 ## 安装
 
-```xml
-<PackageReference Include="SuperKv" Version="0.1.0" />
-```
+客户端库：
 
-## 使用
+    <PackageReference Include="SuperKv" Version="0.1.0" />
 
-先启动 Garnet，然后在每个业务进程中创建并复用一个长生命周期客户端：
+服务端工具：
 
-```csharp
-using SuperKv;
+    dotnet tool install --global SuperKv.Server --version 0.1.0
+    superkv-server --pipe SuperKv.Default --request-timeout-ms 30000
 
-await using ISuperKv kv = await SuperKvClient.OpenAsync(new SuperKvOptions
-{
-    KeyPrefix = "my-app:",
-    Garnet = new GarnetOptions
+服务必须明确启动。客户端不会自动启动、选举或托管服务端。
+
+也可以在自己的服务进程中运行：
+
+    using SuperKv;
+
+    var server = new SuperKvMemoryServer(new SuperKvServerOptions
     {
-        ConnectionString = "127.0.0.1:6379,abortConnect=false"
-    }
-});
+        PipeName = "MyApp.Kv",
+        RequestTimeout = TimeSpan.FromSeconds(30)
+    });
+    server.Run(stoppingToken);
 
-await kv.SetStringAsync("camera:status", "running", TimeSpan.FromMinutes(1));
-string? status = await kv.GetStringAsync("camera:status");
-long frame = await kv.IncrementAsync("camera:frame");
-```
+## 客户端 API
 
-`SuperKvClient` 内部复用一个 `ConnectionMultiplexer`，不要为每次读写创建客户端。
+客户端只提供静态 Connect、同步 Get/Set 和释放：
 
-后台线程、Worker Service 或控制台程序也可使用同步 API：
+    using SuperKv;
 
-```csharp
-using ISuperKv kv = SuperKvClient.Open(options);
-kv.SetString("camera:status", "running");
-string? status = kv.GetString("camera:status");
-byte[]? payload = kv.GetValue("camera:frame");
-```
+    using SuperKvClient kv = SuperKvClient.Connect(new SuperKvOptions
+    {
+        PipeName = "MyApp.Kv",
+        KeyPrefix = "camera-app:",
+        ConnectTimeout = TimeSpan.FromSeconds(5)
+    });
 
-同步 API 直接使用 StackExchange.Redis 的同步调用，不做 async-over-sync，因此不依赖 `SynchronizationContext`、不会产生该类死锁。同步网络 I/O 仍会占用调用线程；WinForms、WPF、WinUI、MAUI 等 UI 事件处理程序应使用上方异步 API，才能保证界面不被阻塞。
+    kv.Set("camera:status", "running"u8.ToArray());
+    byte[]? status = kv.Get("camera:status"); // 不存在时返回 null
 
-## API
+ConnectTimeout 只限制建立连接的等待时间。构造函数不公开，客户端必须通过静态 Connect 创建。
 
-```csharp
-bool written = await kv.SetAsync(
-    "key",
-    new byte[] { 1, 2, 3 },
-    timeToLive: TimeSpan.FromSeconds(30),
-    condition: SuperKvSetCondition.OnlyIfMissing);
+同步实现直接执行同步 Pipe I/O，不等待异步 continuation，也不访问 SynchronizationContext，因此不会发生 WinForms/WPF 同步上下文死锁。但同步 IPC 必然占用调用线程直到响应返回；要求界面始终可响应时，应由调用方在线程池或专用工作线程调用。
 
-byte[]? value = await kv.GetAsync("key");
-bool exists = await kv.ExistsAsync("key");
-TimeSpan? ttl = await kv.GetTimeToLiveAsync("key");
-bool deleted = await kv.DeleteAsync("key");
-```
+## 并发与断线语义
 
-- `GetTimeToLiveAsync` 返回 `null` 表示键不存在或没有过期时间。
-- `IncrementAsync` 要求已有值是十进制 `Int64`；不存在时从 `0` 开始。
-- `KeyPrefix` 用于隔离同一 Garnet 实例中的不同应用。
-- 取消正在执行的写操作只停止本地等待，服务端操作仍可能已完成。
+- 一个 SuperKvClient 持有一条 Pipe；同一实例上的重叠调用在客户端内部排队，避免请求帧和响应帧交错。
+- 不同客户端各自使用独立 Pipe，服务端并行处理并直接访问线程安全的 ConcurrentDictionary。
+- 请求采用“长度头 + 消息体”分帧，只有完整收到整帧后才执行命令。
+- 客户端声明长度后不继续发送时，服务端在 RequestTimeout 到期后关闭该连接，其他客户端不受影响。
+- 通信失败后客户端连接作废，不会自动恢复或重试；调用方应重新 Connect。
+- 如果服务端已经执行 Set，但响应在途中丢失，客户端无法判断该次写入是否生效。是否重试由调用方决定；同值覆盖写通常可安全重试。
 
-## 验证
+SuperKv 没有 TTL、删除、存在判断、计数、持久化、自动恢复或分布式能力。
 
-测试会在随机本机端口启动真实 Garnet 2.1.4：
+## 验证与打包
 
-```powershell
-dotnet build SuperKv.slnx -c Release
-dotnet test tests/SuperKv.Tests -c Release
-dotnet run --project tests/SuperKv.SmokeTests -c Release
-```
+    dotnet build SuperKv.slnx -c Release
+    dotnet test tests/SuperKv.Tests -c Release
+    dotnet run --project tests/SuperKv.SmokeTests -c Release
+    dotnet pack src/SuperKv/SuperKv.csproj -c Release -o artifacts
+    dotnet pack src/SuperKv.Server/SuperKv.Server.csproj -c Release -o artifacts
 
-当前 SuperKv 程序集覆盖率：行 100%、分支 91.17%、方法 100%。测试矩阵、覆盖率命令和延迟基准见 [docs/TESTING.md](docs/TESTING.md)。
-
-GitHub Actions 在每次推送/拉取请求中执行快速质量门禁并生成可下载的 NuGet 包；每周及手动工作流执行 .NET SDK、并发客户端数量、持续负载和延迟基准的长矩阵。
-
-本地打包：
-
-```powershell
-dotnet pack src/SuperKv/SuperKv.csproj -c Release
-```
+测试矩阵、覆盖率和延迟基准见 docs/TESTING.md。GitHub Actions 会构建客户端 NuGet 和显式服务端 Tool 包。

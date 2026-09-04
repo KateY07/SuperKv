@@ -1,110 +1,174 @@
-using System.Text.Json;
+using System.Buffers.Binary;
+using System.IO.Pipes;
 using Xunit;
 
 namespace SuperKv.Tests;
 
-[Collection(GarnetCollection.Name)]
+[Collection(MemoryServerCollection.Name)]
 public sealed class SuperKvEdgeTests
 {
-    readonly GarnetFixture _garnet;
+    readonly MemoryServerFixture _server;
 
-    public SuperKvEdgeTests(GarnetFixture garnet) => _garnet = garnet;
+    public SuperKvEdgeTests(MemoryServerFixture server) => _server = server;
 
     [Fact]
-    public async Task IncrementHandlesSignsInvalidDataAndOverflow()
+    public void PrefixesUnicodeKeysAndLargeValuesRoundTrip()
     {
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
+        string firstPrefix = $"one:{Guid.NewGuid():N}:";
+        string secondPrefix = $"two:{Guid.NewGuid():N}:";
+        using SuperKvClient first = _server.Connect(firstPrefix);
+        using SuperKvClient second = _server.Connect(secondPrefix);
+        string key = "相机:📷:" + new string('k', 4096);
+        byte[] large = new byte[1024 * 1024];
+        Random.Shared.NextBytes(large);
 
-        Assert.Equal(1, await kv.IncrementAsync("new"));
-        Assert.Equal(-1, await kv.IncrementAsync("new", -2));
-        await kv.SetStringAsync("number", "41");
-        Assert.Equal(42, await kv.IncrementAsync("number"));
+        first.Set(key, large);
+        second.Set(key, new byte[] { 1 });
 
-        await kv.SetStringAsync("invalid", "not-a-number");
-        await Assert.ThrowsAnyAsync<Exception>(async () => await kv.IncrementAsync("invalid"));
-        await kv.SetStringAsync("overflow", long.MaxValue.ToString());
-        await Assert.ThrowsAnyAsync<Exception>(async () => await kv.IncrementAsync("overflow"));
+        Assert.Equal(large, first.Get(key));
+        Assert.Equal(new byte[] { 1 }, second.Get(key));
     }
 
     [Fact]
-    public async Task PrefixesIsolateClients()
+    public void OptionsAndKeysAreValidated()
     {
-        await using ISuperKv first = await _garnet.OpenClientAsync($"one:{Guid.NewGuid():N}:");
-        await using ISuperKv second = await _garnet.OpenClientAsync($"two:{Guid.NewGuid():N}:");
-
-        await first.SetStringAsync("key", "first");
-        await second.SetStringAsync("key", "second");
-        Assert.Equal("first", await first.GetStringAsync("key"));
-        Assert.Equal("second", await second.GetStringAsync("key"));
-    }
-
-    [Fact]
-    public async Task JsonOptionsAndInvalidJsonAreHonored()
-    {
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
-        var options = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
-        var expected = new JsonValue("camera", 7);
-
-        await kv.SetJsonAsync("valid", expected, serializerOptions: options);
-        Assert.Equal(expected, await kv.GetJsonAsync<JsonValue>("valid", options));
-        await kv.SetStringAsync("invalid", "not-json");
-        await Assert.ThrowsAsync<JsonException>(async () => await kv.GetJsonAsync<JsonValue>("invalid"));
-    }
-
-    [Fact]
-    public async Task OptionsKeysTtlAndConditionAreValidated()
-    {
-        await Assert.ThrowsAsync<ArgumentNullException>(async () => await SuperKvClient.OpenAsync(
-            new SuperKvOptions { Garnet = null! }));
-        await Assert.ThrowsAsync<ArgumentException>(async () => await SuperKvClient.OpenAsync(
+        Assert.Throws<ArgumentException>(() => SuperKvClient.Connect(
+            new SuperKvOptions { PipeName = " " }));
+        Assert.ThrowsAny<ArgumentException>(() => SuperKvClient.Connect(
             new SuperKvOptions { KeyPrefix = null! }));
-        await Assert.ThrowsAsync<ArgumentException>(async () => await SuperKvClient.OpenAsync(
-            new SuperKvOptions { Garnet = new GarnetOptions { ConnectionString = " " } }));
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await SuperKvClient.OpenAsync(
-            new SuperKvOptions(), new CancellationToken(canceled: true)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => SuperKvClient.Connect(
+            new SuperKvOptions { ConnectTimeout = TimeSpan.Zero }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => SuperKvClient.Connect(
+            new SuperKvOptions { ConnectTimeout = TimeSpan.FromDays(30) }));
+        Assert.Throws<ArgumentException>(() => new SuperKvMemoryServer(
+            new SuperKvServerOptions { PipeName = " " }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SuperKvMemoryServer(
+            new SuperKvServerOptions { RequestTimeout = TimeSpan.Zero }));
 
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
-        Assert.Throws<ArgumentException>(() => kv.GetAsync(string.Empty));
-        Assert.Throws<ArgumentException>(() => kv.SetAsync(string.Empty, ReadOnlyMemory<byte>.Empty));
-        Assert.Throws<ArgumentException>(() => kv.DeleteAsync(string.Empty));
-        Assert.Throws<ArgumentException>(() => kv.ExistsAsync(string.Empty));
-        Assert.Throws<ArgumentException>(() => kv.IncrementAsync(string.Empty));
-        Assert.Throws<ArgumentException>(() => kv.GetTimeToLiveAsync(string.Empty));
-        Assert.Throws<ArgumentOutOfRangeException>(
-            () => kv.SetAsync("key", ReadOnlyMemory<byte>.Empty, TimeSpan.Zero));
-        Assert.Throws<ArgumentOutOfRangeException>(
-            () => kv.SetAsync("key", ReadOnlyMemory<byte>.Empty, TimeSpan.FromTicks(-1)));
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () => await kv.SetAsync(
-            "key", ReadOnlyMemory<byte>.Empty, condition: (SuperKvSetCondition)999));
+        using SuperKvClient kv = _server.Connect();
+        Assert.Throws<ArgumentException>(() => kv.Get(string.Empty));
+        Assert.Throws<ArgumentException>(() => kv.Set(string.Empty, ReadOnlyMemory<byte>.Empty));
     }
 
     [Fact]
-    public async Task DisposalIsIdempotentAndRejectsFurtherCalls()
+    public void ServerMustBeStartedExplicitlyAndConnectTimeoutIsBounded()
     {
-        ISuperKv kv = await _garnet.OpenClientAsync();
-        await kv.DisposeAsync();
-        await kv.DisposeAsync();
+        var options = new SuperKvOptions
+        {
+            PipeName = $"SuperKv.Missing.{Guid.NewGuid():N}",
+            ConnectTimeout = TimeSpan.FromMilliseconds(50)
+        };
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
-        Assert.Throws<ObjectDisposedException>(() => kv.GetAsync("key"));
-        Assert.Throws<ObjectDisposedException>(() => kv.SetAsync("key", ReadOnlyMemory<byte>.Empty));
-        Assert.Throws<ObjectDisposedException>(() => kv.DeleteAsync("key"));
-        Assert.Throws<ObjectDisposedException>(() => kv.ExistsAsync("key"));
-        Assert.Throws<ObjectDisposedException>(() => kv.IncrementAsync("key"));
-        Assert.Throws<ObjectDisposedException>(() => kv.GetTimeToLiveAsync("key"));
+        TimeoutException exception = Assert.Throws<TimeoutException>(() => SuperKvClient.Connect(options));
+
+        stopwatch.Stop();
+        Assert.Contains("Start the server first", exception.Message);
+        Assert.InRange(stopwatch.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(5));
     }
 
     [Fact]
-    public async Task ExtensionsRejectNullReceiversAndNullStrings()
+    public async Task IncompleteFrameTimesOutAndOnlyThatConnectionIsClosed()
     {
-        ISuperKv? missing = null;
-        Assert.Throws<ArgumentNullException>(() => missing!.SetStringAsync("key", "value"));
-        await Assert.ThrowsAsync<ArgumentNullException>(async () => await missing!.GetStringAsync("key"));
-        Assert.Throws<ArgumentNullException>(() => missing!.SetJsonAsync("key", new JsonValue("x", 1)));
-        await Assert.ThrowsAsync<ArgumentNullException>(async () => await missing!.GetJsonAsync<JsonValue>("key"));
+        string pipeName = $"SuperKv.Partial.{Guid.NewGuid():N}";
+        using var shutdown = new CancellationTokenSource();
+        var server = new SuperKvMemoryServer(new SuperKvServerOptions
+        {
+            PipeName = pipeName,
+            RequestTimeout = TimeSpan.FromMilliseconds(100)
+        });
+        Task serverTask = Task.Factory.StartNew(
+            () => server.Run(shutdown.Token),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
 
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
-        Assert.Throws<ArgumentNullException>(() => kv.SetStringAsync("key", null!));
+        try
+        {
+            using var stalled = new NamedPipeClientStream(
+                ".",
+                pipeName,
+                PipeDirection.InOut,
+                PipeOptions.Asynchronous | PipeOptions.WriteThrough | PipeOptions.CurrentUserOnly);
+            stalled.Connect(1000);
+
+            byte[] length = new byte[sizeof(int)];
+            BinaryPrimitives.WriteInt32LittleEndian(length, 4096);
+            stalled.Write(length);
+            stalled.WriteByte(1);
+            stalled.Flush();
+
+            await Task.Delay(300);
+            bool disconnected = await Task.Run(() =>
+            {
+                try
+                {
+                    return stalled.ReadByte() < 0;
+                }
+                catch (IOException)
+                {
+                    return true;
+                }
+            }).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(disconnected);
+
+            using SuperKvClient healthy = SuperKvClient.Connect(new SuperKvOptions { PipeName = pipeName });
+            healthy.Set("after-timeout", new byte[] { 7 });
+            Assert.Equal(new byte[] { 7 }, healthy.Get("after-timeout"));
+        }
+        finally
+        {
+            await shutdown.CancelAsync();
+            await serverTask;
+        }
     }
 
-    sealed record JsonValue(string Name, int Count);
+    [Fact]
+    public async Task ExactlyOneServerOwnsAPipe()
+    {
+        string pipeName = $"SuperKv.Ownership.{Guid.NewGuid():N}";
+        using var shutdown = new CancellationTokenSource();
+        var first = new SuperKvMemoryServer(new SuperKvServerOptions { PipeName = pipeName });
+        var second = new SuperKvMemoryServer(new SuperKvServerOptions { PipeName = pipeName });
+        Task firstTask = Task.Factory.StartNew(
+            () => first.Run(shutdown.Token),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+        using SuperKvClient readiness = SuperKvClient.Connect(new SuperKvOptions { PipeName = pipeName });
+
+        Assert.Throws<InvalidOperationException>(() => second.Run(shutdown.Token));
+        Assert.Throws<InvalidOperationException>(() => first.Run(shutdown.Token));
+
+        await shutdown.CancelAsync();
+        await firstTask;
+    }
+
+    [Fact]
+    public void ClientPublicApiIsExactlyConnectGetSetAndDispose()
+    {
+        Assert.Empty(typeof(SuperKvClient).GetConstructors());
+
+        string[] methods = typeof(SuperKvClient)
+            .GetMethods(System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.Static |
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.DeclaredOnly)
+            .Select(method => method.Name)
+            .Order()
+            .ToArray();
+
+        Assert.Equal(new[] { "Connect", "Dispose", "Get", "Set" }, methods);
+    }
+
+    [Fact]
+    public void DisposalIsIdempotentAndRejectsFurtherCalls()
+    {
+        SuperKvClient kv = _server.Connect();
+        kv.Dispose();
+        kv.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => kv.Get("key"));
+        Assert.Throws<ObjectDisposedException>(() => kv.Set("key", ReadOnlyMemory<byte>.Empty));
+    }
 }

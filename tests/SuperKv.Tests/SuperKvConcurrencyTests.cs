@@ -2,87 +2,130 @@ using Xunit;
 
 namespace SuperKv.Tests;
 
-[Collection(GarnetCollection.Name)]
+[Collection(MemoryServerCollection.Name)]
 public sealed class SuperKvConcurrencyTests
 {
-    readonly GarnetFixture _garnet;
+    readonly MemoryServerFixture _server;
 
-    public SuperKvConcurrencyTests(GarnetFixture garnet) => _garnet = garnet;
+    public SuperKvConcurrencyTests(MemoryServerFixture server) => _server = server;
 
     [Fact]
-    public async Task SharedClientHandlesThirtyTwoConcurrentWriters()
+    public async Task SharedClientSerializesThirtyTwoConcurrentCallersWithoutFrameCorruption()
     {
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
+        using SuperKvClient kv = _server.Connect();
         const int workers = 32;
-        int operationsPerWorker = StressSettings.OperationCount(250);
+        int operationsPerWorker = StressSettings.OperationCount(200);
 
-        Task[] tasks = Enumerable.Range(0, workers).Select(_ => Task.Run(async () =>
+        Task[] tasks = Enumerable.Range(0, workers).Select(worker => Task.Run(() =>
         {
-            for (int i = 0; i < operationsPerWorker; i++)
-                await kv.IncrementAsync("counter");
+            string key = $"worker:{worker}";
+            for (int iteration = 0; iteration < operationsPerWorker; iteration++)
+            {
+                byte[] expected = BitConverter.GetBytes(((long)worker << 32) | (uint)iteration);
+                kv.Set(key, expected);
+                Assert.Equal(expected, kv.Get(key));
+            }
         })).ToArray();
 
         await Task.WhenAll(tasks);
-        Assert.Equal(workers * operationsPerWorker, await kv.IncrementAsync("counter", 0));
     }
 
     [Fact]
-    public async Task EightIndependentClientsDoNotLoseWrites()
+    public async Task IndependentClientsWriteToConcurrentDictionaryInParallel()
     {
+        const int clientCount = 12;
+        int operationsPerClient = StressSettings.OperationCount(150);
         string prefix = $"multi:{Guid.NewGuid():N}:";
-        int operationsPerClient = StressSettings.OperationCount(200);
-        var clients = new List<ISuperKv>();
+        var clients = new List<SuperKvClient>(clientCount);
+
         try
         {
-            for (int i = 0; i < 8; i++)
-                clients.Add(await _garnet.OpenClientAsync(prefix));
+            for (int i = 0; i < clientCount; i++)
+                clients.Add(_server.Connect(prefix));
 
-            Task[] tasks = clients.Select(client => Task.Run(async () =>
+            Task[] tasks = clients.Select((client, clientIndex) => Task.Run(() =>
             {
-                for (int i = 0; i < operationsPerClient; i++)
-                    await client.IncrementAsync("counter");
+                for (int iteration = 0; iteration < operationsPerClient; iteration++)
+                {
+                    string key = $"client:{clientIndex}:item:{iteration}";
+                    client.Set(key, BitConverter.GetBytes(iteration));
+                }
             })).ToArray();
 
             await Task.WhenAll(tasks);
-            Assert.Equal(8 * operationsPerClient, await clients[0].IncrementAsync("counter", 0));
+
+            for (int clientIndex = 0; clientIndex < clientCount; clientIndex++)
+            {
+                for (int iteration = 0; iteration < operationsPerClient; iteration++)
+                {
+                    string key = $"client:{clientIndex}:item:{iteration}";
+                    Assert.Equal(BitConverter.GetBytes(iteration), clients[0].Get(key));
+                }
+            }
         }
         finally
         {
-            foreach (ISuperKv client in clients)
-                await client.DisposeAsync();
+            foreach (SuperKvClient client in clients)
+                client.Dispose();
         }
-    }
-
-    [Fact]
-    public async Task OnlyOneConcurrentCreateWins()
-    {
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
-        Task<bool>[] attempts = Enumerable.Range(0, 64)
-            .Select(index => kv.SetStringAsync(
-                "winner", index.ToString(), condition: SuperKvSetCondition.OnlyIfMissing).AsTask())
-            .ToArray();
-
-        bool[] results = await Task.WhenAll(attempts);
-        Assert.Single(results, result => result);
-        Assert.NotNull(await kv.GetStringAsync("winner"));
     }
 
     [Fact]
     public async Task ConcurrentHotReadsReturnUnchangedPayload()
     {
-        await using ISuperKv kv = await _garnet.OpenClientAsync();
-        int operationsPerReader = StressSettings.OperationCount(200);
-        byte[] expected = new byte[4096];
+        string prefix = $"reads:{Guid.NewGuid():N}:";
+        byte[] expected = new byte[64 * 1024];
         Random.Shared.NextBytes(expected);
-        await kv.SetAsync("payload", expected);
+        var clients = new List<SuperKvClient>();
 
-        Task[] readers = Enumerable.Range(0, 32).Select(_ => Task.Run(async () =>
+        try
         {
-            for (int i = 0; i < operationsPerReader; i++)
-                Assert.Equal(expected, await kv.GetAsync("payload"));
-        })).ToArray();
+            for (int i = 0; i < 16; i++)
+                clients.Add(_server.Connect(prefix));
 
-        await Task.WhenAll(readers);
+            clients[0].Set("payload", expected);
+            int readsPerClient = StressSettings.OperationCount(100);
+            Task[] readers = clients.Select(client => Task.Run(() =>
+            {
+                for (int i = 0; i < readsPerClient; i++)
+                    Assert.Equal(expected, client.Get("payload"));
+            })).ToArray();
+
+            await Task.WhenAll(readers);
+        }
+        finally
+        {
+            foreach (SuperKvClient client in clients)
+                client.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task IndependentClientsCanOverwriteOneHotKeyConcurrently()
+    {
+        string prefix = $"writes:{Guid.NewGuid():N}:";
+        byte[] value = new byte[4096];
+        Random.Shared.NextBytes(value);
+        var clients = Enumerable.Range(0, 16)
+            .Select(_ => _server.Connect(prefix))
+            .ToArray();
+
+        try
+        {
+            int writesPerClient = StressSettings.OperationCount(200);
+            await Task.WhenAll(clients.Select(client => Task.Run(() =>
+            {
+                for (int i = 0; i < writesPerClient; i++)
+                    client.Set("hot", value);
+            })));
+
+            Assert.Equal(value, clients[0].Get("hot"));
+        }
+        finally
+        {
+            foreach (SuperKvClient client in clients)
+                client.Dispose();
+        }
     }
 }
 

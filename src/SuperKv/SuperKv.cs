@@ -1,500 +1,498 @@
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.IO.Pipes;
+using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using StackExchange.Redis;
 
 namespace SuperKv;
 
-/// <summary>Condition applied when setting a key.</summary>
-public enum SuperKvSetCondition
-{
-    /// <summary>Create or replace the key.</summary>
-    Always,
-
-    /// <summary>Write only when the key does not currently exist.</summary>
-    OnlyIfMissing,
-
-    /// <summary>Write only when the key currently exists.</summary>
-    OnlyIfPresent
-}
-
-/// <summary>Connection settings for the Garnet backend.</summary>
-public sealed class GarnetOptions
-{
-    /// <summary>StackExchange.Redis connection string for Garnet.</summary>
-    public string ConnectionString { get; init; } = "127.0.0.1:6379,abortConnect=false";
-
-    /// <summary>Logical database number.</summary>
-    public int Database { get; init; }
-}
-
-/// <summary>Configuration used to open a <see cref="SuperKvClient"/>.</summary>
 public sealed class SuperKvOptions
 {
-    /// <summary>Prefix prepended to every key, useful for application isolation.</summary>
+    public string PipeName { get; init; } = "SuperKv.Default";
+
     public string KeyPrefix { get; init; } = string.Empty;
 
-    /// <summary>Garnet connection settings.</summary>
-    public GarnetOptions Garnet { get; init; } = new();
+    public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(5);
 }
 
-/// <summary>Backend-neutral byte-oriented key-value operations.</summary>
-public interface ISuperKv : IDisposable, IAsyncDisposable
+public sealed class SuperKvServerOptions
 {
-    /// <summary>Synchronously creates or updates a value. Throws on a thread with a synchronization context.</summary>
-    bool SetValue(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always);
+    public string PipeName { get; init; } = "SuperKv.Default";
 
-    /// <summary>Synchronously gets a copy of a value, or <see langword="null"/> when absent.</summary>
-    byte[]? GetValue(string key);
-
-    /// <summary>Synchronously deletes a key and returns whether it existed.</summary>
-    bool Delete(string key);
-
-    /// <summary>Synchronously returns whether a non-expired key exists.</summary>
-    bool Exists(string key);
-
-    /// <summary>Synchronously atomically adds <paramref name="delta"/> to an integer value.</summary>
-    long Increment(string key, long delta = 1);
-
-    /// <summary>Synchronously gets the remaining lifetime.</summary>
-    TimeSpan? GetTimeToLive(string key);
-
-    /// <summary>Creates or updates a value.</summary>
-    ValueTask<bool> SetAsync(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>Gets a copy of a value, or <see langword="null"/> when it is absent or expired.</summary>
-    ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken = default);
-
-    /// <summary>Deletes a key and returns whether it existed.</summary>
-    ValueTask<bool> DeleteAsync(string key, CancellationToken cancellationToken = default);
-
-    /// <summary>Returns whether a non-expired key exists.</summary>
-    ValueTask<bool> ExistsAsync(string key, CancellationToken cancellationToken = default);
-
-    /// <summary>Atomically adds <paramref name="delta"/> to an integer value.</summary>
-    ValueTask<long> IncrementAsync(string key, long delta = 1, CancellationToken cancellationToken = default);
-
-    /// <summary>Gets the remaining lifetime. Null means absent or no expiry.</summary>
-    ValueTask<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default);
+    public TimeSpan RequestTimeout { get; init; } = TimeSpan.FromSeconds(30);
 }
 
-/// <summary>Long-lived, thread-safe SuperKv client. Create one instance per process and reuse it.</summary>
-public sealed class SuperKvClient : ISuperKv
+public sealed class SuperKvClient : IDisposable
 {
-    readonly ISuperKvBackend _backend;
+    readonly string _pipeName;
+    readonly string _keyPrefix;
+    readonly int _connectTimeoutMilliseconds;
+    readonly SemaphoreSlim _pipeGate = new(1, 1);
+    NamedPipeClientStream? _pipe;
     int _disposed;
 
-    SuperKvClient(ISuperKvBackend backend) => _backend = backend;
-
-    /// <summary>Opens Garnet synchronously.</summary>
-    public static SuperKvClient Open(SuperKvOptions? options = null)
+    SuperKvClient(SuperKvOptions options)
     {
-        options ??= new SuperKvOptions();
-        ValidateOptions(options);
-        return new SuperKvClient(GarnetBackend.Open(options));
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.PipeName);
+        ArgumentNullException.ThrowIfNull(options.KeyPrefix);
+
+        if (options.ConnectTimeout <= TimeSpan.Zero ||
+            options.ConnectTimeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "ConnectTimeout must be greater than zero and at most Int32.MaxValue milliseconds.");
+        }
+
+        _pipeName = options.PipeName;
+        _keyPrefix = options.KeyPrefix;
+        _connectTimeoutMilliseconds = checked((int)Math.Ceiling(options.ConnectTimeout.TotalMilliseconds));
     }
 
-    /// <summary>Opens Garnet asynchronously.</summary>
-    public static async ValueTask<SuperKvClient> OpenAsync(
-        SuperKvOptions? options = null,
-        CancellationToken cancellationToken = default)
+    public static SuperKvClient Connect(SuperKvOptions? options = null)
     {
-        options ??= new SuperKvOptions();
-        ValidateOptions(options);
+        var client = new SuperKvClient(options ?? new SuperKvOptions());
+        var pipe = client.CreatePipe();
 
-        ISuperKvBackend backend = await GarnetBackend.OpenAsync(options, cancellationToken).ConfigureAwait(false);
-        return new SuperKvClient(backend);
+        try
+        {
+            pipe.Connect(client._connectTimeoutMilliseconds);
+            client._pipe = pipe;
+            return client;
+        }
+        catch (TimeoutException exception)
+        {
+            pipe.Dispose();
+            throw new TimeoutException(
+                "Could not connect to SuperKv pipe '" + client._pipeName + "'. Start the server first.",
+                exception);
+        }
+        catch
+        {
+            pipe.Dispose();
+            throw;
+        }
     }
 
-    /// <inheritdoc />
-    public bool SetValue(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always)
+    public void Set(string key, ReadOnlyMemory<byte> value)
     {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        ValidateTimeToLive(timeToLive);
-        return _backend.SetValue(key, value, timeToLive, condition);
+        string qualifiedKey = QualifyKey(key);
+        byte[] request = SuperKvProtocol.CreateSetRequest(qualifiedKey, value.Span);
+        Execute(request, static response =>
+        {
+            SuperKvProtocol.ReadSetResponse(response);
+            return true;
+        });
     }
 
-    /// <inheritdoc />
-    public byte[]? GetValue(string key)
+    public byte[]? Get(string key)
     {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.GetValue(key);
+        string qualifiedKey = QualifyKey(key);
+        byte[] request = SuperKvProtocol.CreateGetRequest(qualifiedKey);
+        return Execute(request, SuperKvProtocol.ReadGetResponse);
     }
 
-    /// <inheritdoc />
-    public bool Delete(string key)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.Delete(key);
-    }
-
-    /// <inheritdoc />
-    public bool Exists(string key)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.Exists(key);
-    }
-
-    /// <inheritdoc />
-    public long Increment(string key, long delta = 1)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.Increment(key, delta);
-    }
-
-    /// <inheritdoc />
-    public TimeSpan? GetTimeToLive(string key)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.GetTimeToLive(key);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<bool> SetAsync(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        ValidateTimeToLive(timeToLive);
-        return _backend.SetAsync(key, value, timeToLive, condition, cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.GetAsync(key, cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<bool> DeleteAsync(string key, CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.DeleteAsync(key, cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<bool> ExistsAsync(string key, CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.ExistsAsync(key, cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<long> IncrementAsync(
-        string key,
-        long delta = 1,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.IncrementAsync(key, delta, cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public ValueTask<TimeSpan?> GetTimeToLiveAsync(
-        string key,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        ValidateKey(key);
-        return _backend.GetTimeToLiveAsync(key, cancellationToken);
-    }
-
-    /// <inheritdoc />
     public void Dispose()
-    {
-        if (Volatile.Read(ref _disposed) != 0)
-            return;
-
-        if (Interlocked.Exchange(ref _disposed, 1) == 0)
-            _backend.Dispose();
-        GC.SuppressFinalize(this);
-    }
-
-    /// <inheritdoc />
-    public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        await _backend.DisposeAsync().ConfigureAwait(false);
-        GC.SuppressFinalize(this);
+        NamedPipeClientStream? pipe = Interlocked.Exchange(ref _pipe, null);
+        pipe?.Dispose();
+        _pipeGate.Dispose();
     }
 
-    static void ValidateOptions(SuperKvOptions options)
+
+    NamedPipeClientStream CreatePipe() => new(
+        ".",
+        _pipeName,
+        PipeDirection.InOut,
+        PipeOptions.Asynchronous | PipeOptions.WriteThrough | PipeOptions.CurrentUserOnly);
+
+    T Execute<T>(byte[] request, Func<byte[], T> readResponse)
     {
-        ArgumentNullException.ThrowIfNull(options.Garnet);
+        ThrowIfDisposed();
+        _pipeGate.Wait();
 
-        if (options.KeyPrefix is null)
-            throw new ArgumentException("KeyPrefix cannot be null.", nameof(options));
-
-        if (string.IsNullOrWhiteSpace(options.Garnet.ConnectionString))
-            throw new ArgumentException("A Garnet connection string is required.", nameof(options));
+        try
+        {
+            NamedPipeClientStream pipe = _pipe ?? throw new IOException("The SuperKv connection is closed.");
+            SuperKvProtocol.WriteFrame(pipe, request);
+            byte[] response = SuperKvProtocol.ReadFrame(pipe);
+            return readResponse(response);
+        }
+        catch
+        {
+            BreakConnection();
+            throw;
+        }
+        finally
+        {
+            _pipeGate.Release();
+        }
     }
 
-    static void ValidateKey(string key) => ArgumentException.ThrowIfNullOrEmpty(key);
 
-    static void ValidateTimeToLive(TimeSpan? timeToLive)
+    string QualifyKey(string key)
     {
-        if (timeToLive is { } ttl && ttl <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(timeToLive), "TTL must be positive.");
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        return string.Concat(_keyPrefix, key);
     }
 
-    void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed != 0, this);
-}
-
-/// <summary>Convenience operations for strings and JSON values.</summary>
-public static class SuperKvExtensions
-{
-    /// <summary>Synchronously stores a UTF-8 string.</summary>
-    public static bool SetString(
-        this ISuperKv kv,
-        string key,
-        string value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always)
+    void BreakConnection()
     {
-        ArgumentNullException.ThrowIfNull(kv);
-        ArgumentNullException.ThrowIfNull(value);
-        return kv.SetValue(key, Encoding.UTF8.GetBytes(value), timeToLive, condition);
+        NamedPipeClientStream? pipe = Interlocked.Exchange(ref _pipe, null);
+        pipe?.Dispose();
     }
 
-    /// <summary>Synchronously gets a UTF-8 string.</summary>
-    public static string? GetString(this ISuperKv kv, string key)
+    void ThrowIfDisposed()
     {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[]? value = kv.GetValue(key);
-        return value is null ? null : Encoding.UTF8.GetString(value);
-    }
-
-    /// <summary>Synchronously serializes and stores a JSON value.</summary>
-    public static bool SetJson<T>(
-        this ISuperKv kv,
-        string key,
-        T value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always,
-        JsonSerializerOptions? serializerOptions = null)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[] json = JsonSerializer.SerializeToUtf8Bytes(value, serializerOptions);
-        return kv.SetValue(key, json, timeToLive, condition);
-    }
-
-    /// <summary>Synchronously gets and deserializes a JSON value.</summary>
-    public static T? GetJson<T>(
-        this ISuperKv kv,
-        string key,
-        JsonSerializerOptions? serializerOptions = null)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[]? json = kv.GetValue(key);
-        return json is null ? default : JsonSerializer.Deserialize<T>(json, serializerOptions);
-    }
-
-    /// <summary>Stores a UTF-8 string.</summary>
-    public static ValueTask<bool> SetStringAsync(
-        this ISuperKv kv,
-        string key,
-        string value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        ArgumentNullException.ThrowIfNull(value);
-        return kv.SetAsync(key, Encoding.UTF8.GetBytes(value), timeToLive, condition, cancellationToken);
-    }
-
-    /// <summary>Gets a UTF-8 string.</summary>
-    public static async ValueTask<string?> GetStringAsync(
-        this ISuperKv kv,
-        string key,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[]? value = await kv.GetAsync(key, cancellationToken).ConfigureAwait(false);
-        return value is null ? null : Encoding.UTF8.GetString(value);
-    }
-
-    /// <summary>Serializes and stores a JSON value.</summary>
-    public static ValueTask<bool> SetJsonAsync<T>(
-        this ISuperKv kv,
-        string key,
-        T value,
-        TimeSpan? timeToLive = null,
-        SuperKvSetCondition condition = SuperKvSetCondition.Always,
-        JsonSerializerOptions? serializerOptions = null,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[] json = JsonSerializer.SerializeToUtf8Bytes(value, serializerOptions);
-        return kv.SetAsync(key, json, timeToLive, condition, cancellationToken);
-    }
-
-    /// <summary>Gets and deserializes a JSON value.</summary>
-    public static async ValueTask<T?> GetJsonAsync<T>(
-        this ISuperKv kv,
-        string key,
-        JsonSerializerOptions? serializerOptions = null,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(kv);
-        byte[]? json = await kv.GetAsync(key, cancellationToken).ConfigureAwait(false);
-        return json is null ? default : JsonSerializer.Deserialize<T>(json, serializerOptions);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
     }
 }
 
-interface ISuperKvBackend : IDisposable, IAsyncDisposable
+public sealed class SuperKvMemoryServer
 {
-    bool SetValue(string key, ReadOnlyMemory<byte> value, TimeSpan? timeToLive, SuperKvSetCondition condition);
-    byte[]? GetValue(string key);
-    bool Delete(string key);
-    bool Exists(string key);
-    long Increment(string key, long delta);
-    TimeSpan? GetTimeToLive(string key);
+    readonly string _pipeName;
+    readonly TimeSpan _requestTimeout;
+    readonly ConcurrentDictionary<string, byte[]> _values = new(StringComparer.Ordinal);
+    int _running;
 
-    ValueTask<bool> SetAsync(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive,
-        SuperKvSetCondition condition,
-        CancellationToken cancellationToken);
-
-    ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken);
-    ValueTask<bool> DeleteAsync(string key, CancellationToken cancellationToken);
-    ValueTask<bool> ExistsAsync(string key, CancellationToken cancellationToken);
-    ValueTask<long> IncrementAsync(string key, long delta, CancellationToken cancellationToken);
-    ValueTask<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken);
-}
-
-sealed class GarnetBackend : ISuperKvBackend
-{
-    readonly ConnectionMultiplexer _connection;
-    readonly IDatabase _database;
-    readonly string _keyPrefix;
-
-    GarnetBackend(ConnectionMultiplexer connection, int database, string keyPrefix)
+    public SuperKvMemoryServer(SuperKvServerOptions? options = null)
     {
-        _connection = connection;
-        _database = connection.GetDatabase(database);
-        _keyPrefix = keyPrefix;
+        options ??= new SuperKvServerOptions();
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.PipeName);
+        if (options.RequestTimeout <= TimeSpan.Zero ||
+            options.RequestTimeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "RequestTimeout must be greater than zero and at most Int32.MaxValue milliseconds.");
+        }
+
+        _pipeName = options.PipeName;
+        _requestTimeout = options.RequestTimeout;
     }
 
-    public static GarnetBackend Open(SuperKvOptions options) =>
-        new(ConnectionMultiplexer.Connect(options.Garnet.ConnectionString), options.Garnet.Database, options.KeyPrefix);
+    public void Run(CancellationToken cancellationToken = default)
+    {
+        if (Interlocked.Exchange(ref _running, 1) != 0)
+            throw new InvalidOperationException("This SuperKv server instance is already running.");
 
-    public static async ValueTask<GarnetBackend> OpenAsync(
-        SuperKvOptions options,
+        using var ownership = new Semaphore(1, 1, CreateOwnershipName(_pipeName));
+        bool ownsServer = false;
+        NamedPipeServerStream? listener = null;
+
+        try
+        {
+            ownsServer = ownership.WaitOne(0);
+
+            if (!ownsServer)
+                throw new InvalidOperationException($"A SuperKv server already owns pipe '{_pipeName}'.");
+
+            listener = CreateListener();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    using CancellationTokenRegistration stopWaiting = cancellationToken.Register(
+                        static state => ((NamedPipeServerStream)state!).Dispose(),
+                        listener);
+                    listener.WaitForConnection();
+                }
+                catch (Exception exception) when (
+                    cancellationToken.IsCancellationRequested &&
+                    exception is ObjectDisposedException or IOException)
+                {
+                    break;
+                }
+
+                NamedPipeServerStream connected = listener;
+                listener = CreateListener();
+                _ = HandleClientAsync(connected, cancellationToken);
+            }
+        }
+        finally
+        {
+            listener?.Dispose();
+            if (ownsServer)
+                ownership.Release();
+            Volatile.Write(ref _running, 0);
+        }
+    }
+
+    NamedPipeServerStream CreateListener() => new(
+        _pipeName,
+        PipeDirection.InOut,
+        NamedPipeServerStream.MaxAllowedServerInstances,
+        PipeTransmissionMode.Byte,
+        PipeOptions.Asynchronous | PipeOptions.WriteThrough | PipeOptions.CurrentUserOnly);
+
+    async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken cancellationToken)
+    {
+        await using (pipe.ConfigureAwait(false))
+        using (var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            try
+            {
+                while (pipe.IsConnected)
+                {
+                    requestTimeout.CancelAfter(_requestTimeout);
+                    byte[] request = await SuperKvProtocol.ReadFrameAsync(pipe, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    requestTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
+                    byte[] response;
+
+                    try
+                    {
+                        response = Process(request);
+                    }
+                    catch (Exception exception) when (exception is not OperationCanceledException)
+                    {
+                        response = SuperKvProtocol.CreateErrorResponse(exception.Message);
+                    }
+
+                    await SuperKvProtocol.WriteFrameAsync(pipe, response, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (Exception exception) when (
+                exception is EndOfStreamException or IOException or InvalidDataException or OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    byte[] Process(byte[] frame)
+    {
+        SuperKvRequest request = SuperKvProtocol.ReadRequest(frame);
+
+        switch (request.Operation)
+        {
+            case SuperKvOperation.Set:
+                _values[request.Key] = request.Value!;
+                return SuperKvProtocol.CreateSetResponse();
+
+            case SuperKvOperation.Get:
+                _values.TryGetValue(request.Key, out byte[]? value);
+                return SuperKvProtocol.CreateGetResponse(value);
+
+            default:
+                throw new InvalidDataException("Unsupported SuperKv operation.");
+        }
+    }
+
+    static string CreateOwnershipName(string pipeName)
+    {
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(pipeName));
+        return $"Local\\SuperKv.Server.{Convert.ToHexString(hash)}";
+    }
+}
+
+enum SuperKvOperation : byte
+{
+    Get = 1,
+    Set = 2
+}
+
+readonly record struct SuperKvRequest(SuperKvOperation Operation, string Key, byte[]? Value);
+
+static class SuperKvProtocol
+{
+    const byte Version = 1;
+    const byte Success = 0;
+    const byte Error = 1;
+    const int MaxFrameLength = 128 * 1024 * 1024;
+
+    public static byte[] CreateGetRequest(string key) => CreatePayload(writer =>
+    {
+        writer.Write(Version);
+        writer.Write((byte)SuperKvOperation.Get);
+        writer.Write(key);
+    });
+
+    public static byte[] CreateSetRequest(string key, ReadOnlySpan<byte> value)
+    {
+        byte[] copiedValue = value.ToArray();
+        return CreatePayload(writer =>
+        {
+            writer.Write(Version);
+            writer.Write((byte)SuperKvOperation.Set);
+            writer.Write(key);
+            writer.Write(copiedValue.Length);
+            writer.Write(copiedValue);
+        });
+    }
+
+    public static SuperKvRequest ReadRequest(byte[] frame)
+    {
+        using var stream = new MemoryStream(frame, writable: false);
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+        ReadAndValidateVersion(reader);
+
+        var operation = (SuperKvOperation)reader.ReadByte();
+        string key = reader.ReadString();
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        byte[]? value = operation == SuperKvOperation.Set ? ReadBytes(reader) : null;
+        EnsureFullyRead(stream);
+        return new SuperKvRequest(operation, key, value);
+    }
+
+    public static byte[] CreateSetResponse() => CreatePayload(writer =>
+    {
+        writer.Write(Version);
+        writer.Write(Success);
+    });
+
+    public static byte[] CreateGetResponse(byte[]? value) => CreatePayload(writer =>
+    {
+        writer.Write(Version);
+        writer.Write(Success);
+        writer.Write(value is not null);
+
+        if (value is not null)
+        {
+            writer.Write(value.Length);
+            writer.Write(value);
+        }
+    });
+
+    public static byte[] CreateErrorResponse(string message) => CreatePayload(writer =>
+    {
+        writer.Write(Version);
+        writer.Write(Error);
+        writer.Write(message);
+    });
+
+    public static void ReadSetResponse(byte[] frame)
+    {
+        using var stream = OpenSuccessResponse(frame, out BinaryReader reader);
+        reader.Dispose();
+        EnsureFullyRead(stream);
+    }
+
+    public static byte[]? ReadGetResponse(byte[] frame)
+    {
+        using MemoryStream stream = OpenSuccessResponse(frame, out BinaryReader reader);
+        using (reader)
+        {
+            bool found = reader.ReadBoolean();
+            byte[]? value = found ? ReadBytes(reader) : null;
+            EnsureFullyRead(stream);
+            return value;
+        }
+    }
+
+    public static void WriteFrame(Stream stream, byte[] frame)
+    {
+        ValidateFrameLength(frame.Length);
+        Span<byte> length = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(length, frame.Length);
+        stream.Write(length);
+        stream.Write(frame);
+        stream.Flush();
+    }
+
+    public static byte[] ReadFrame(Stream stream)
+    {
+        Span<byte> length = stackalloc byte[sizeof(int)];
+        stream.ReadExactly(length);
+        int frameLength = BinaryPrimitives.ReadInt32LittleEndian(length);
+        ValidateFrameLength(frameLength);
+        byte[] frame = GC.AllocateUninitializedArray<byte>(frameLength);
+        stream.ReadExactly(frame);
+        return frame;
+    }
+
+    public static async ValueTask WriteFrameAsync(
+        Stream stream,
+        byte[] frame,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        ConnectionMultiplexer connection = await ConnectionMultiplexer
-            .ConnectAsync(options.Garnet.ConnectionString)
-            .ConfigureAwait(false);
-        return new GarnetBackend(connection, options.Garnet.Database, options.KeyPrefix);
+        ValidateFrameLength(frame.Length);
+        byte[] length = new byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(length, frame.Length);
+        await stream.WriteAsync(length, cancellationToken).ConfigureAwait(false);
+        await stream.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public bool SetValue(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive,
-        SuperKvSetCondition condition) =>
-        _database.StringSet(FormatKey(key), value.ToArray(), timeToLive, MapCondition(condition));
-
-    public byte[]? GetValue(string key)
-    {
-        RedisValue value = _database.StringGet(FormatKey(key));
-        return value.IsNull ? null : (byte[]?)value;
-    }
-
-    public bool Delete(string key) => _database.KeyDelete(FormatKey(key));
-
-    public bool Exists(string key) => _database.KeyExists(FormatKey(key));
-
-    public long Increment(string key, long delta) => _database.StringIncrement(FormatKey(key), delta);
-
-    public TimeSpan? GetTimeToLive(string key) => _database.KeyTimeToLive(FormatKey(key));
-
-    public async ValueTask<bool> SetAsync(
-        string key,
-        ReadOnlyMemory<byte> value,
-        TimeSpan? timeToLive,
-        SuperKvSetCondition condition,
+    public static async ValueTask<byte[]> ReadFrameAsync(
+        Stream stream,
         CancellationToken cancellationToken)
     {
-        Task<bool> operation = _database.StringSetAsync(
-            FormatKey(key),
-            value.ToArray(),
-            timeToLive,
-            MapCondition(condition));
-        return await operation.WaitAsync(cancellationToken).ConfigureAwait(false);
+        byte[] length = new byte[sizeof(int)];
+        await stream.ReadExactlyAsync(length, cancellationToken).ConfigureAwait(false);
+        int frameLength = BinaryPrimitives.ReadInt32LittleEndian(length);
+        ValidateFrameLength(frameLength);
+        byte[] frame = GC.AllocateUninitializedArray<byte>(frameLength);
+        await stream.ReadExactlyAsync(frame, cancellationToken).ConfigureAwait(false);
+        return frame;
     }
 
-    public async ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken)
+    static byte[] CreatePayload(Action<BinaryWriter> write)
     {
-        RedisValue value = await _database.StringGetAsync(FormatKey(key))
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-        return value.IsNull ? null : (byte[]?)value;
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+            write(writer);
+        return stream.ToArray();
     }
 
-    public async ValueTask<bool> DeleteAsync(string key, CancellationToken cancellationToken) =>
-        await _database.KeyDeleteAsync(FormatKey(key)).WaitAsync(cancellationToken).ConfigureAwait(false);
-
-    public async ValueTask<bool> ExistsAsync(string key, CancellationToken cancellationToken) =>
-        await _database.KeyExistsAsync(FormatKey(key)).WaitAsync(cancellationToken).ConfigureAwait(false);
-
-    public async ValueTask<long> IncrementAsync(
-        string key,
-        long delta,
-        CancellationToken cancellationToken) =>
-        await _database.StringIncrementAsync(FormatKey(key), delta)
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-    public async ValueTask<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken) =>
-        await _database.KeyTimeToLiveAsync(FormatKey(key))
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-    public void Dispose() => _connection.Dispose();
-
-    public async ValueTask DisposeAsync() => await _connection.DisposeAsync().ConfigureAwait(false);
-
-    static When MapCondition(SuperKvSetCondition condition) => condition switch
+    static MemoryStream OpenSuccessResponse(byte[] frame, out BinaryReader reader)
     {
-        SuperKvSetCondition.Always => When.Always,
-        SuperKvSetCondition.OnlyIfMissing => When.NotExists,
-        SuperKvSetCondition.OnlyIfPresent => When.Exists,
-        _ => throw new ArgumentOutOfRangeException(nameof(condition), condition, "Unknown set condition.")
-    };
+        var stream = new MemoryStream(frame, writable: false);
+        reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
 
-    RedisKey FormatKey(string key) => _keyPrefix + key;
+        try
+        {
+            ReadAndValidateVersion(reader);
+            byte status = reader.ReadByte();
+
+            if (status == Error)
+                throw new InvalidOperationException(reader.ReadString());
+            if (status != Success)
+                throw new InvalidDataException("Invalid SuperKv response status.");
+
+            return stream;
+        }
+        catch
+        {
+            reader.Dispose();
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    static byte[] ReadBytes(BinaryReader reader)
+    {
+        int length = reader.ReadInt32();
+        ValidateFrameLength(length);
+        byte[] value = reader.ReadBytes(length);
+
+        if (value.Length != length)
+            throw new EndOfStreamException("Unexpected end of SuperKv payload.");
+
+        return value;
+    }
+
+    static void ReadAndValidateVersion(BinaryReader reader)
+    {
+        if (reader.ReadByte() != Version)
+            throw new InvalidDataException("Unsupported SuperKv protocol version.");
+    }
+
+    static void EnsureFullyRead(MemoryStream stream)
+    {
+        if (stream.Position != stream.Length)
+            throw new InvalidDataException("The SuperKv frame contains trailing data.");
+    }
+
+    static void ValidateFrameLength(int length)
+    {
+        if (length < 0 || length > MaxFrameLength)
+            throw new InvalidDataException($"SuperKv frame length must be between 0 and {MaxFrameLength} bytes.");
+    }
 }

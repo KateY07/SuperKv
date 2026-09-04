@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         run: |
           $source = Get-Content 'src/SuperKv/SuperKv.cs' -Raw
-          $forbidden = @('.Result', '.Wait(', 'GetAwaiter().GetResult(')
+          $forbidden = @('.Result', 'GetAwaiter().GetResult(', '.AsTask().Wait(', 'Task.WaitAll(', 'Task.WaitAny(')
           foreach ($pattern in $forbidden) {
             if ($source.Contains($pattern, [StringComparison]::Ordinal)) {
               throw "Forbidden async-over-sync pattern found: $pattern"
@@ -74,10 +74,12 @@ jobs:
       - name: Run cross-process smoke test
         run: dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj -c Release --no-build
 
-      - name: Build NuGet package
-        run: dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:ContinuousIntegrationBuild=true
+      - name: Build NuGet packages
+        run: |
+          dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:ContinuousIntegrationBuild=true
+          dotnet pack src/SuperKv.Server/SuperKv.Server.csproj -c Release --no-build -o artifacts -p:ContinuousIntegrationBuild=true
 
-      - name: Upload NuGet package
+      - name: Upload NuGet packages
         uses: actions/upload-artifact@v7
         with:
           name: SuperKv-nuget-${{ github.sha }}

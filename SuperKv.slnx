@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/SuperKv/SuperKv.csproj" />
+    <Project Path="src/SuperKv.Server/SuperKv.Server.csproj" />
   </Folder>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/SuperKv.Benchmarks/SuperKv.Benchmarks.csproj" />

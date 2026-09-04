@@ -1,0 +1,96 @@
+name: Release NuGet packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  verify-pack-release:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Derive package version from tag
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Tag '$env:GITHUB_REF_NAME' is not a supported package version."
+          }
+          "PACKAGE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Restore
+        run: dotnet restore SuperKv.slnx
+
+      - name: Verify formatting and analyzers
+        run: dotnet format SuperKv.slnx --verify-no-changes --no-restore
+
+      - name: Build with warnings as errors
+        run: dotnet build SuperKv.slnx -c Release --no-restore
+
+      - name: Run fast test suite
+        run: >-
+          dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release
+          --no-build --no-restore
+          --filter "Category!=LongRunning"
+
+      - name: Run cross-process smoke test
+        run: >-
+          dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj
+          -c Release --no-build --no-restore
+
+      - name: Pack NuGet packages
+        shell: pwsh
+        run: |
+          dotnet pack src/SuperKv/SuperKv.csproj -c Release --no-build -o artifacts -p:PackageVersion=$env:PACKAGE_VERSION -p:ContinuousIntegrationBuild=true
+          dotnet pack src/SuperKv.Server/SuperKv.Server.csproj -c Release --no-build -o artifacts -p:PackageVersion=$env:PACKAGE_VERSION -p:ContinuousIntegrationBuild=true
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem artifacts -Filter '*.nupkg' |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } |
+            Set-Content artifacts/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(
+            Get-ChildItem artifacts -Filter '*.nupkg' | ForEach-Object FullName
+            Join-Path $env:GITHUB_WORKSPACE 'artifacts/SHA256SUMS.txt'
+          )
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $assets --clobber
+          }
+          else {
+            gh release create $tag $assets --verify-tag --generate-notes --title "SuperKv $tag"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release command failed with exit code $LASTEXITCODE."
+          }

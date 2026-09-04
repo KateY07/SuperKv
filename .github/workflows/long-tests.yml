@@ -8,7 +8,7 @@ on:
       duration_seconds:
         description: Sustained-load duration for each matrix job
         required: true
-        default: '120'
+        default: '1800'
         type: string
       stress_multiplier:
         description: Multiplier for regular concurrency-test operation counts
@@ -38,7 +38,7 @@ jobs:
   stress:
     name: Stress - ${{ matrix.sdk }} SDK - ${{ matrix.clients }} clients
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -48,7 +48,7 @@ jobs:
     env:
       SUPERKV_LONG_TESTS: 1
       SUPERKV_LONG_CLIENTS: ${{ matrix.clients }}
-      SUPERKV_LONG_DURATION_SECONDS: ${{ inputs.duration_seconds || '120' }}
+      SUPERKV_LONG_DURATION_SECONDS: ${{ inputs.duration_seconds || '1800' }}
       SUPERKV_STRESS_MULTIPLIER: ${{ inputs.stress_multiplier || '10' }}
 
     steps:
@@ -81,7 +81,7 @@ jobs:
         run: dotnet run --project tests/SuperKv.SmokeTests/SuperKv.SmokeTests.csproj -c Release --no-restore
 
   benchmark:
-    name: Garnet latency benchmark
+    name: Named Pipe latency benchmark
     if: github.event_name == 'schedule' || inputs.run_benchmarks == true
     runs-on: windows-latest
     timeout-minutes: 180

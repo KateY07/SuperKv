@@ -1,97 +1,57 @@
 # 测试与性能验证
 
-SuperKv 是薄封装，测试聚焦本库拥有的行为和边界，不重复验证 Garnet 服务端内部算法。
+SuperKv 的客户端、服务端、协议和存储实现集中在一个 SuperKv.cs。测试围绕同步 Get/Set、Named Pipe 边界和多进程共享语义展开。
 
 ## 覆盖范围
 
-| 层级 | 当前验证 |
+| 层级 | 验证内容 |
 |---|---|
-| 静态分析 | SDK `latest-recommended` analyzers、代码风格检查、警告视为错误、禁用 async-over-sync 模式 |
-| API 契约 | 同步/异步字节、字符串、JSON、缺失值、删除、存在判断、全部 Set 条件、TTL、原子计数；非泵送同步上下文回归 |
-| 边界 | 空键、无效 TTL、非法条件、无效 JSON、非数字计数、Int64 溢出、重复释放、释放后访问 |
-| 高并发 | 32 路共享客户端执行 8000 次原子写；8 个独立客户端竞争写；64 路 NX；32 路热读；操作量可按环境变量放大 |
-| 多进程 | 父进程启动真实 Garnet，子进程读取父进程数据并原子更新计数 |
-| 持续负载 | 1/8/32 个独立客户端持续执行 SET/GET/INCR，并核对无丢失原子计数 |
-| 性能 | BenchmarkDotNet 对比 SuperKv 与原始 StackExchange.Redis 的 GET/SET/INCR |
+| 静态分析 | SDK latest-recommended analyzers、格式检查、警告视为错误、禁止同步等待异步任务 |
+| API 契约 | Get 缺失返回 null、空值、覆盖写、值副本隔离、连接超时、参数验证和释放 |
+| 同一客户端 | 32 路调用共享一条 Pipe，客户端内部排队且协议帧不交错 |
+| 多客户端 | 12 条独立 Pipe 并行写入，16 条 Pipe 热读和热写 |
+| 极端输入 | Unicode/超长键、0 B、1 B、1 MiB 值 |
+| 不完整命令 | 合法长度头后停发，单帧超时关闭该连接，健康客户端继续工作 |
+| 多进程 | 父进程启动服务，真实子进程读写同一份内存数据 |
+| 同步上下文 | API 在不泵送的自定义 SynchronizationContext 中完成 |
+| 性能 | BenchmarkDotNet 测量同步 Get/Set，覆盖 16 B 至 64 KiB 值 |
+| 长时压力 | 1/8/32 客户端，循环 0 B 至 1 MiB 边界值、冷热键和读写校验 |
 
-## GitHub Actions
+## 快速验证
 
-- `CI and NuGet package` 在每次推送和拉取请求中执行格式检查、静态分析、构建、快速测试、90% 行/分支覆盖率门禁、多进程 smoke test，并上传 `.nupkg` 与 Cobertura 报告。
-- `Long test matrix` 每周日 03:17（北京时间）运行，也可在 Actions 页面手动触发。矩阵覆盖 .NET 8/10 SDK 与 1/8/32 个独立客户端；常规并发操作量默认放大 10 倍，每个持续负载用例默认运行 120 秒。
-- 长工作流同时运行完整 GET/SET/INCR × 4 种值大小的 BenchmarkDotNet `MediumRun`，报告保存为工作流产物。手动触发时可改用 `short` 或 `long`。
-
-GitHub 托管 Runner 的单个 Job 最长可运行 6 小时；本仓库另设 30 分钟压力测试和 180 分钟基准测试超时，避免故障任务无界占用额度。云端共享 Runner 适合发现明显回归，微秒级绝对延迟仍应在固定硬件上复核。
-## 正式测试
-
-```powershell
-dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release
-```
+    dotnet format SuperKv.slnx --verify-no-changes --no-restore
+    dotnet build SuperKv.slnx -c Release --no-restore
+    dotnet test tests/SuperKv.Tests -c Release --filter "Category!=LongRunning"
+    dotnet run --project tests/SuperKv.SmokeTests -c Release
 
 ## 覆盖率
 
-只统计 `SuperKv`，不把 Garnet、StackExchange.Redis 或测试程序集算入指标：
+    dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release \
+      --filter "Category!=LongRunning" \
+      /p:CollectCoverage=true \
+      /p:CoverletOutput=../../TestResults/coverage.cobertura.xml \
+      /p:CoverletOutputFormat=cobertura \
+      "/p:Include=[SuperKv]*" \
+      "/p:Exclude=[SuperKv.Tests]*"
 
-```powershell
-dotnet test tests/SuperKv.Tests/SuperKv.Tests.csproj -c Release `
-  /p:CollectCoverage=true `
-  /p:CoverletOutput=../../TestResults/coverage.cobertura.xml `
-  /p:CoverletOutputFormat=cobertura `
-  '/p:Include=[SuperKv]*' `
-  '/p:Exclude=[SuperKv.Tests]*'
-```
+当前快速套件实测：行覆盖率 98.17%、分支覆盖率 93.10%、方法覆盖率 100%。CI 门槛为行 90%、分支 90%。
 
-当前实测结果：
+## GitHub Actions
 
-| Line | Branch | Method |
-|---:|---:|---:|
-| 100% | 91.17% | 100% |
+- CI and NuGet package：每次推送和拉取请求运行格式、静态分析、构建、快速测试、覆盖率、跨进程测试，并生成 SuperKv 与 SuperKv.Server 两个 NuGet 包。
+- Long test matrix：每周或手动执行 .NET 8/10 SDK × 1/8/32 客户端矩阵；默认每个持续测试运行 1800 秒。
+- 长工作流另外运行同步 Get/Set 的 BenchmarkDotNet 延迟基准并上传报告。
 
-### 2026-09-04 GET ShortRun 基线
+## 本地 30 分钟压力测试
 
-环境：Windows 11、Intel Core Ultra 9 285H、.NET 8.0.29、Garnet 2.1.4，1 次 launch、3 次 warmup、3 次测量。
-
-| 值大小 | Raw 均值 | SuperKv 均值 | 均值比率 | Raw 分配 | SuperKv 分配 |
-|---:|---:|---:|---:|---:|---:|
-| 16 B | 41.08 µs | 41.95 µs | 1.02 | 352 B | 472 B |
-| 128 B | 34.80 µs | 52.82 µs | 1.52 | 464 B | 584 B |
-| 1 KiB | 41.30 µs | 57.80 µs | 1.40 | 1,360 B | 1,480 B |
-| 64 KiB | 99.50 µs | 114.54 µs | 1.16 | 65,896 B | 66,016 B |
-
-短样本的置信区间较宽，只适合验证基准链路并建立初始参考。稳定回归判断应增加 launch 和 iteration，并保证电源计划及后台负载一致。完整报告由 BenchmarkDotNet 输出到 `BenchmarkDotNet.Artifacts/results`，该目录不提交 Git。
-本地选择更长的 BenchmarkDotNet job：
-
-```powershell
-$env:SUPERKV_BENCHMARK_JOB = 'medium' # 可选 short、medium、long
-dotnet run --project benchmarks/SuperKv.Benchmarks -c Release -- --filter '*'
-```
-
-本地运行与 Actions 等价的长压力测试：
-
-```powershell
-$env:SUPERKV_LONG_TESTS = '1'
-$env:SUPERKV_LONG_CLIENTS = '32'
-$env:SUPERKV_LONG_DURATION_SECONDS = '120'
-$env:SUPERKV_STRESS_MULTIPLIER = '10'
-dotnet test tests/SuperKv.Tests -c Release
-```
-## 多进程 smoke test
-
-```powershell
-dotnet run --project tests/SuperKv.SmokeTests -c Release
-```
+    $env:SUPERKV_LONG_TESTS = '1'
+    $env:SUPERKV_LONG_CLIENTS = '32'
+    $env:SUPERKV_LONG_DURATION_SECONDS = '1800'
+    dotnet test tests/SuperKv.Tests -c Release --filter "Category=LongRunning"
 
 ## 延迟基准
 
-```powershell
-dotnet run --project benchmarks/SuperKv.Benchmarks -c Release -- --filter '*'
-```
+    $env:SUPERKV_BENCHMARK_JOB = 'medium'
+    dotnet run --project benchmarks/SuperKv.Benchmarks -c Release -- --filter '*'
 
-只测试 GET：
-
-```powershell
-dotnet run --project benchmarks/SuperKv.Benchmarks -c Release -- --filter '*Get*'
-```
-
-报告包含均值、P50、P95、吞吐相关统计和每次操作的托管分配。基准在 16 B、128 B、1 KiB、64 KiB 四种值大小下，将 SuperKv 与同一 Garnet 实例上的原始 StackExchange.Redis 调用直接对比。
-
-绝对延迟依赖 CPU、电源计划、调试器、防病毒软件和系统负载。回归判断应优先观察同机同批次的 SuperKv/Raw 比值；建议把 P95 比值恶化 10% 作为调查阈值，而不是跨机器比较固定微秒数。
+云端共享 Runner 适合发现明显回归；微秒级绝对延迟应在固定硬件、电源计划和系统负载下复核。

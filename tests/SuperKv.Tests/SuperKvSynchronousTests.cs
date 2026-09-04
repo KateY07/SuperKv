@@ -2,78 +2,15 @@ using Xunit;
 
 namespace SuperKv.Tests;
 
-[Collection(GarnetCollection.Name)]
+[Collection(MemoryServerCollection.Name)]
 public sealed class SuperKvSynchronousTests
 {
-    readonly GarnetFixture _garnet;
+    readonly MemoryServerFixture _server;
 
-    public SuperKvSynchronousTests(GarnetFixture garnet) => _garnet = garnet;
-
-    [Fact]
-    public void SynchronousApiCoversBytesStringsJsonTtlConditionsAndCounters()
-    {
-        using ISuperKv kv = SuperKvClient.Open(new SuperKvOptions
-        {
-            KeyPrefix = $"sync:{Guid.NewGuid():N}:",
-            Garnet = new GarnetOptions { ConnectionString = _garnet.ConnectionString }
-        });
-
-        byte[] source = [0, 1, 127, 128, 255];
-        Assert.True(kv.SetValue("bytes", source));
-        source[0] = 42;
-        Assert.Equal(new byte[] { 0, 1, 127, 128, 255 }, kv.GetValue("bytes"));
-        Assert.Null(kv.GetValue("missing"));
-
-        Assert.True(kv.SetString("text", "相机-🚀"));
-        Assert.Equal("相机-🚀", kv.GetString("text"));
-        Assert.Null(kv.GetString("missing"));
-
-        var expected = new CameraState("capturing", 17);
-        Assert.True(kv.SetJson("json", expected));
-        Assert.Equal(expected, kv.GetJson<CameraState>("json"));
-        Assert.Null(kv.GetJson<CameraState>("missing"));
-
-        Assert.False(kv.SetString("conditional", "missing", condition: SuperKvSetCondition.OnlyIfPresent));
-        Assert.True(kv.SetString("conditional", "first", condition: SuperKvSetCondition.OnlyIfMissing));
-        Assert.False(kv.SetString("conditional", "ignored", condition: SuperKvSetCondition.OnlyIfMissing));
-        Assert.True(kv.SetString("conditional", "second", condition: SuperKvSetCondition.OnlyIfPresent));
-        Assert.Equal("second", kv.GetString("conditional"));
-
-        Assert.True(kv.SetString("ttl", "value", TimeSpan.FromSeconds(10)));
-        Assert.InRange(kv.GetTimeToLive("ttl")!.Value, TimeSpan.Zero, TimeSpan.FromSeconds(10));
-        Assert.Null(kv.GetTimeToLive("missing"));
-
-        Assert.Equal(1, kv.Increment("counter"));
-        Assert.Equal(5, kv.Increment("counter", 4));
-        Assert.True(kv.Exists("counter"));
-        Assert.True(kv.Delete("counter"));
-        Assert.False(kv.Exists("counter"));
-        Assert.False(kv.Delete("counter"));
-    }
+    public SuperKvSynchronousTests(MemoryServerFixture server) => _server = server;
 
     [Fact]
-    public void SynchronousApiValidatesInputsAndDisposal()
-    {
-        ISuperKv kv = SuperKvClient.Open(new SuperKvOptions
-        {
-            KeyPrefix = $"sync-edge:{Guid.NewGuid():N}:",
-            Garnet = new GarnetOptions { ConnectionString = _garnet.ConnectionString }
-        });
-
-        Assert.Throws<ArgumentException>(() => kv.GetValue(string.Empty));
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            kv.SetValue("key", ReadOnlyMemory<byte>.Empty, TimeSpan.Zero));
-        Assert.Throws<ArgumentOutOfRangeException>(() =>
-            kv.SetValue("key", ReadOnlyMemory<byte>.Empty, condition: (SuperKvSetCondition)999));
-        Assert.Throws<ArgumentNullException>(() => kv.SetString("key", null!));
-
-        kv.Dispose();
-        kv.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => kv.GetValue("key"));
-    }
-
-    [Fact]
-    public async Task SynchronousApiDoesNotDependOnSynchronizationContext()
+    public async Task ApiDoesNotDependOnSynchronizationContext()
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
@@ -81,15 +18,14 @@ public sealed class SuperKvSynchronousTests
             SynchronizationContext.SetSynchronizationContext(new NonPumpingSynchronizationContext());
             try
             {
-                using ISuperKv kv = SuperKvClient.Open(new SuperKvOptions
+                using SuperKvClient kv = SuperKvClient.Connect(new SuperKvOptions
                 {
+                    PipeName = _server.PipeName,
                     KeyPrefix = $"sync-context:{Guid.NewGuid():N}:",
-                    Garnet = new GarnetOptions { ConnectionString = _garnet.ConnectionString }
+                    ConnectTimeout = TimeSpan.FromSeconds(5)
                 });
-
-                Assert.True(kv.SetString("key", "value"));
-                Assert.Equal("value", kv.GetString("key"));
-                Assert.Equal(1, kv.Increment("counter"));
+                kv.Set("key", new byte[] { 1, 2, 3 });
+                Assert.Equal(new byte[] { 1, 2, 3 }, kv.Get("key"));
                 completion.SetResult(true);
             }
             catch (Exception exception)
@@ -99,7 +35,7 @@ public sealed class SuperKvSynchronousTests
         })
         {
             IsBackground = true,
-            Name = "SuperKv sync-context test"
+            Name = "SuperKv non-pumping synchronization-context test"
         };
 
         thread.Start();
@@ -114,7 +50,6 @@ public sealed class SuperKvSynchronousTests
         }
 
         public override void Send(SendOrPostCallback callback, object? state) =>
-            throw new InvalidOperationException("Synchronous API attempted to use the synchronization context.");
+            throw new InvalidOperationException("SuperKv attempted to use the synchronization context.");
     }
-    sealed record CameraState(string Status, long Frame);
 }

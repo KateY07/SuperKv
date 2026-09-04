@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
@@ -14,16 +15,12 @@
     <PackageId>SuperKv</PackageId>
     <Version>0.1.0</Version>
     <Authors>SuperKv contributors</Authors>
-    <Description>Low-latency local IPC key-value client for Garnet and StackExchange.Redis.</Description>
-    <PackageTags>kv;ipc;garnet;redis;resp;windows</PackageTags>
+    <Description>Low-latency local IPC key-value engine using Named Pipes and ConcurrentDictionary.</Description>
+    <PackageTags>kv;ipc;named-pipe;concurrentdictionary;memory;windows</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
   </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="StackExchange.Redis" Version="3.1.31" />
-  </ItemGroup>
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />
